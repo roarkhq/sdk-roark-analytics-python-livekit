@@ -95,6 +95,11 @@ class CallStartedPayload(TypedDict, total=False):
     agentName: str
     agentPrompt: str
 
+    # Test-vs-production classification. ``observe_session`` sets ``False``,
+    # ``track_session`` sets ``True``. The Roark backend uses this to file the
+    # call under the right bucket on the dashboard.
+    isTest: bool
+
     # Room / job context (purely informational; used for debugging).
     roomSid: str
     roomName: str

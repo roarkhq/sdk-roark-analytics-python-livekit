@@ -117,6 +117,7 @@ async def test_observe_session_posts_call_started_and_ended() -> None:
         livekit_call_id="call-xyz",
         mode="observe",
         capture_audio=False,
+        is_test=False,
         metadata={},
     )
     # Swap in the mocked client.
@@ -160,6 +161,7 @@ async def test_aflush_is_idempotent() -> None:
         livekit_call_id="c1",
         mode="observe",
         capture_audio=False,
+        is_test=False,
         metadata={},
     )
     state._client = client

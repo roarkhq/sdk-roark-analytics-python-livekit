@@ -90,6 +90,7 @@ class _RoarkSession:
         livekit_call_id: str | None,
         mode: Literal["observe", "track"],
         capture_audio: bool,
+        is_test: bool,
         metadata: dict[str, Any],
     ) -> None:
         self._ctx = ctx
@@ -101,6 +102,7 @@ class _RoarkSession:
         self._agent_id = agent_id
         self._agent_name = agent_name
         self._agent_prompt = agent_prompt
+        self._is_test = is_test
         self._livekit_call_id = livekit_call_id or str(uuid.uuid4())
 
         self._transcript: list[TranscriptMessage] = []
@@ -137,6 +139,7 @@ class _RoarkSession:
             "livekitCallId": self._livekit_call_id,
             "eventTimestamp": self._call_started_iso,
             "agentId": self._agent_id,
+            "isTest": self._is_test,
         }
         if self._agent_name:
             payload["agentName"] = self._agent_name
@@ -542,6 +545,7 @@ async def observe_session(
     livekit_call_id: str | None = None,
     capture_audio: bool = True,
     capture_logs: bool = True,  # noqa: ARG001 — reserved for future log streaming
+    is_test: bool = False,
     **metadata: Any,
 ) -> _RoarkSession | None:
     """Capture a production LiveKit Agents session and ship it to Roark.
@@ -560,6 +564,9 @@ async def observe_session(
         capture_audio: Set to ``False`` to skip stereo audio capture (saves
             bandwidth; transcripts and tool data still ship).
         capture_logs: Reserved for future log streaming.
+        is_test: Tag the call as a test on the Roark dashboard. ``observe_session``
+            defaults to ``False`` (production traffic); ``track_session`` defaults
+            to ``True``.
         **metadata: Free-form metadata for Roark-side correlation (passed
             through to call-started).
 
@@ -597,6 +604,7 @@ async def observe_session(
         livekit_call_id=livekit_call_id,
         mode="observe",
         capture_audio=capture_audio,
+        is_test=is_test,
         metadata=metadata,
     )
     await state.start()
@@ -615,6 +623,7 @@ async def track_session(
     livekit_call_id: str | None = None,
     capture_audio: bool = True,
     capture_logs: bool = True,  # noqa: ARG001
+    is_test: bool = True,
     **metadata: Any,
 ) -> _RoarkSession | None:
     """Capture a simulation/test session and inject mocked tools.
@@ -647,6 +656,7 @@ async def track_session(
         livekit_call_id=livekit_call_id,
         mode="track",
         capture_audio=capture_audio,
+        is_test=is_test,
         metadata=metadata,
     )
     await state.start()
