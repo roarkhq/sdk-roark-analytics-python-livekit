@@ -20,8 +20,8 @@ DEFAULT_CHUNK_TIMEOUT_SECONDS = 10.0
 # Roark service endpoints. The integration contract: callers only supply an API key,
 # never a URL. Follows the same /v1/integrations/<provider> shape as Roark's other
 # integrations (vapi, retell, pipecat).
-WEBHOOK_URL = "https://api.roark.ai/v1/integrations/livekit-agents"
-CHUNK_UPLOAD_URL_ENDPOINT = "https://api.roark.ai/v1/integrations/livekit-agents/chunk-upload-url"
+WEBHOOK_URL = "https://api.roark.ai/v1/integrations/livekit-sdk"
+CHUNK_UPLOAD_URL_ENDPOINT = "https://api.roark.ai/v1/integrations/livekit-sdk/chunk-upload-url"
 
 log = logging.getLogger("roark_analytics_python_livekit.client")
 

@@ -92,7 +92,7 @@ a compact event timeline to Roark:
 | **Transcripts** | `session.on("conversation_item_added")` | `ChatMessage` role + content. Both user and assistant turns. |
 | **Tool calls** | `session.on("function_tools_executed")` | Paired `tool_call` / `tool_result` records, keyed by `tool_call_id`. |
 | **Metrics** | `session.on("metrics_collected")` | EOU / STT / LLM / TTS / Agent latency + LLM token usage. |
-| **Audio** | `ctx.room.on("track_subscribed")` + `ctx.room.on("local_track_published")` | Stereo PCM (L=user, R=agent), chunked PUTs to Roark via `/v1/integrations/livekit-agents/chunk-upload-url`. |
+| **Audio** | `ctx.room.on("track_subscribed")` + `ctx.room.on("local_track_published")` | Stereo PCM (L=user, R=agent), chunked PUTs to Roark via `/v1/integrations/livekit-sdk/chunk-upload-url`. |
 | **Session end** | `ctx.add_shutdown_callback(...)` (or explicit `await state.aflush()`) | Flushes pending state, drains in-flight uploads, POSTs `call-ended`. Roark stitches the chunks into a WAV on its side. |
 
 Failures are logged and swallowed — **the helpers never raise into the

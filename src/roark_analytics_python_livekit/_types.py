@@ -1,10 +1,10 @@
 """Wire-format types for the Roark LiveKit-Agents webhook contract.
 
 These shapes are what the helpers in ``session.py`` POST to
-``/v1/integrations/livekit-agents`` on call-started / call-ended. The Roark
-backend's ``@roarkanalytics/integrations/livekit-agents`` package owns the
-mapping into Roark's internal ``TranscriptEntry`` / ``ExecutedToolInvocation``
-shapes — this SDK stays dumb and forwards livekit-native shapes verbatim.
+``/v1/integrations/livekit-sdk`` on call-started / call-ended. The Roark
+backend's ``@roarkanalytics/integrations/livekit`` package owns the mapping
+into Roark's internal ``TranscriptEntry`` / ``ExecutedToolInvocation`` shapes
+— this SDK stays dumb and forwards livekit-native shapes verbatim.
 """
 
 from __future__ import annotations

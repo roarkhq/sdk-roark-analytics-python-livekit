@@ -46,7 +46,7 @@ examples = [
 
 [project.urls]
 Homepage = "https://roark.ai"
-Documentation = "https://docs.roark.ai/integrations/livekit-agents"
+Documentation = "https://docs.roark.ai/integrations/livekit"
 Repository = "https://github.com/roarkhq/sdk-roark-analytics-python-livekit"
 Issues = "https://github.com/roarkhq/sdk-roark-analytics-python-livekit/issues"
 

@@ -13,4 +13,4 @@ Initial release.
 - `get_simulation_data(ctx)` — parse the `roark.*` block of `JobContext.job.metadata`.
 - Kill switches: `ROARK_OBSERVABILITY_ENABLED`, `ROARK_TRACING_ENABLED`,
   `ROARK_MOCK_TOOLS_ENABLED`.
-- Endpoints: `https://api.roark.ai/v1/integrations/livekit-agents`.
+- Endpoints: `https://api.roark.ai/v1/integrations/livekit-sdk`.
