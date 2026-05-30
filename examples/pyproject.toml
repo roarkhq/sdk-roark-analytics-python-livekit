@@ -1,0 +1,19 @@
+[project]
+name = "roark-livekit-example"
+version = "0"
+description = "Runnable self-hosted LiveKit + Roark analytics example."
+requires-python = ">=3.10"
+dependencies = [
+    "livekit-agents[openai,cartesia,silero,turn-detector]",
+    "livekit-plugins-speechmatics",
+    "roark-analytics-python-livekit",
+]
+
+[tool.uv]
+# This project is just a runnable example — don't try to build/install it as a
+# package, only manage its dependencies.
+package = false
+
+[tool.uv.sources]
+# Use the SDK from this repo (one level up) rather than PyPI.
+roark-analytics-python-livekit = { path = "..", editable = true }

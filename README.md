@@ -7,7 +7,8 @@ metrics, and a stereo audio recording. No other code changes required.
 
 - **Tested with** `livekit-agents` 1.x
 - **Python** 3.10+
-- **Same code** runs self-hosted *and* on LiveKit Cloud workers
+- **Built for self-hosted LiveKit** — works against your own `livekit-server`
+  and in local `console` mode
 
 > Maintained by [Roark](https://roark.ai). File issues at
 > <https://github.com/roarkhq/sdk-roark-analytics-python-livekit/issues>.
@@ -18,9 +19,7 @@ metrics, and a stereo audio recording. No other code changes required.
 
 - [Quick start](#quick-start)
 - [How it works](#how-it-works)
-- [Production vs. simulations](#production-vs-simulations)
 - [Examples](#examples)
-- [Mock tools (simulation mode)](#mock-tools-simulation-mode)
 - [Kill switches](#kill-switches)
 - [Troubleshooting](#troubleshooting)
 - [Configuration reference](#configuration-reference)
@@ -92,7 +91,7 @@ a compact event timeline to Roark:
 | **Transcripts** | `session.on("conversation_item_added")` | `ChatMessage` role + content. Both user and assistant turns. |
 | **Tool calls** | `session.on("function_tools_executed")` | Paired `tool_call` / `tool_result` records, keyed by `tool_call_id`. |
 | **Metrics** | `session.on("metrics_collected")` | EOU / STT / LLM / TTS / Agent latency + LLM token usage. |
-| **Audio** | `ctx.room.on("track_subscribed")` + `ctx.room.on("local_track_published")` | Stereo PCM (L=user, R=agent), chunked PUTs to Roark via `/v1/integrations/livekit-sdk/chunk-upload-url`. |
+| **Audio** | Taps on `session.input.audio` (user) + `session.output.audio` (agent) | Stereo PCM (L=user, R=agent), chunked PUTs to Roark via `/v1/integrations/livekit-sdk/chunk-upload-url`. Tapping the session's own audio I/O works the same in `dev` (room) and `console` mode. |
 | **Session end** | `ctx.add_shutdown_callback(...)` (or explicit `await state.aflush()`) | Flushes pending state, drains in-flight uploads, POSTs `call-ended`. Roark stitches the chunks into a WAV on its side. |
 
 Failures are logged and swallowed — **the helpers never raise into the
@@ -100,70 +99,23 @@ session**. Your agent keeps running even if Roark is unreachable.
 
 ---
 
-## Production vs. simulations
-
-| | `observe_session` | `track_session` |
-|---|---|---|
-| Captures transcripts / tools / metrics / audio | yes | yes |
-| Mocks tool implementations from job metadata | no | yes (see below) |
-| Kill switch | `ROARK_OBSERVABILITY_ENABLED=false` | `ROARK_TRACING_ENABLED=false` |
-| Intended for | live customer traffic | Roark simulation runs / agent tests |
-
-The data captured is identical — `track_session` adds optional mock-tool
-injection on top.
-
----
-
 ## Examples
 
-Two example files ship with the package:
-
-- **`examples/observe_agent.py`** — minimal production wiring with
-  `observe_session`. STT / LLM / TTS are left as TODOs — drop in your
-  providers.
-- **`examples/track_agent.py`** — simulation entrypoint using
-  `track_session`. Demonstrates the `@function_tool` mocking flow.
+A complete, runnable self-hosted example ships in
+[`examples/`](./examples/) — a [uv](https://docs.astral.sh/uv/) project with a
+Roark-instrumented support agent plus a short README. The simplest way to try it
+is local console mode (mic + speakers, no LiveKit server or browser needed):
 
 ```bash
-LIVEKIT_URL=wss://... LIVEKIT_API_KEY=... LIVEKIT_API_SECRET=... \\
-ROARK_API_KEY=rk_live_... \\
-    python -m livekit.agents.cli dev examples/observe_agent.py
+cd examples
+uv sync
+cp .env.example .env      # fill in provider keys + ROARK_API_KEY
+uv run --env-file .env agent.py console
 ```
 
----
-
-## Mock tools (simulation mode)
-
-`track_session` reads scripted tool replies from the LiveKit job metadata
-under the `roark.mockTools` key. The Roark simulation orchestrator dispatches
-jobs with metadata like:
-
-```json
-{
-  "roark": {
-    "runId": "sim-run-42",
-    "scenarioId": "happy-path",
-    "mockTools": {
-      "lookup_order": { "orderId": "1", "status": "shipped" },
-      "send_email":   { "ok": true }
-    }
-  }
-}
-```
-
-When `track_session(ctx, session, agent=my_agent, …)` runs, every function
-tool on `my_agent` whose name appears in `mockTools` is swapped for a
-coroutine returning the scripted reply. Tools not listed are left as-is, so
-the simulation can mock a subset.
-
-To inspect the same metadata yourself (e.g. to branch on scenario id):
-
-```python
-from roark_analytics_python_livekit import get_simulation_data
-
-sim = get_simulation_data(ctx)
-scenario_id = sim.get("scenarioId")
-```
+See [`examples/README.md`](./examples/README.md) for local-server mode (a
+self-hosted `livekit-server` + a room client). Everything runs on your own
+machine — no LiveKit Cloud.
 
 ---
 
@@ -175,8 +127,6 @@ touching code:
 | Variable | Effect |
 |----------|--------|
 | `ROARK_OBSERVABILITY_ENABLED=false` | `observe_session` becomes a no-op (returns `None`). |
-| `ROARK_TRACING_ENABLED=false`       | `track_session` becomes a no-op (returns `None`). |
-| `ROARK_MOCK_TOOLS_ENABLED=false`    | `track_session` still ships data but does NOT swap tool callables. |
 
 Treated as off: `false`, `0`, `no`, `off` (case-insensitive). Anything else
 (including the variable being absent) keeps the feature enabled.
@@ -214,11 +164,12 @@ adding your own `session.on("conversation_item_added", print)` listener.
 
 <br>
 
-The user side comes from a remote audio track; the agent side comes from
-the local participant's published audio track. If either is missing on the
-LiveKit room, that side will be silent on the merged stereo recording. Check
-the worker logs for `subscribed to user audio` / `subscribed to agent audio`
-INFO lines.
+The user side is tapped from `session.input.audio`; the agent side from
+`session.output.audio`. The taps are installed by `observe_session`, so it
+**must be called before `session.start()`** (otherwise the session captures
+its audio I/O before the taps are in place). Check the worker logs for
+`tapping user audio input` / `tapping agent audio output` INFO lines — if one
+is missing, that side will be silent on the merged stereo recording.
 
 </details>
 
@@ -235,7 +186,7 @@ INFO lines.
 | `livekit_call_id` | `str \| None` | `ctx.job.id` else UUID | Stable call identifier; sent on every Roark record as `livekitCallId`. |
 | `capture_audio` | `bool` | `True` | Set to `False` to skip stereo capture (saves bandwidth). |
 | `capture_logs` | `bool` | `True` | Reserved for future log streaming. |
-| `agent` (track_session only) | `Agent \| None` | `None` | LiveKit `Agent` whose function tools should be mocked. |
+| `is_test` | `bool` | `False` | Tag the call as a test on the Roark dashboard. |
 | `**metadata` | `dict` | `{}` | Free-form metadata forwarded on `call-started`. |
 
 ---
