@@ -21,4 +21,7 @@ htmlcov/
 .vscode/
 *.swp
 .DS_Store
-uv.lock
+
+# Lockfile is committed — see AGENTS.md. Ignore the example project's lockfile
+# only if you don't want to pin the example's transitive deps; by default it
+# is committed too.
