@@ -1,0 +1,93 @@
+name: Release
+
+# Auto-publish to PyPI on merge to main, but only when the version in
+# pyproject.toml has been bumped. Merging changes that don't touch the
+# version is a no-op (no duplicate-upload failures on PyPI).
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  # 1. Decide whether this push is a release: did the version change?
+  check-version:
+    runs-on: ubuntu-latest
+    outputs:
+      changed: ${{ steps.check.outputs.changed }}
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # need full history so we can see existing tags
+      - name: Check whether the version was bumped
+        id: check
+        run: |
+          version=$(grep -m1 -E '^version = ' pyproject.toml | sed -E 's/version = "(.*)"/\1/')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if git rev-parse "v$version" >/dev/null 2>&1; then
+            echo "Tag v$version already exists — nothing to publish."
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "New version v$version detected — will publish."
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  # 2. Gate the release on the full test/lint/type-check matrix passing.
+  test:
+    needs: check-version
+    if: needs.check-version.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: Lint
+        run: ruff check .
+      - name: Type check
+        run: mypy src/roark_analytics_python_livekit
+      - name: Test
+        run: pytest -q
+
+  # 3. Build, publish to PyPI via Trusted Publishing, then tag + release on GitHub.
+  publish:
+    needs: [check-version, test]
+    if: needs.check-version.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      # PyPI Trusted Publishing — no API token in repo secrets.
+      # See https://docs.pypi.org/trusted-publishers/
+      id-token: write
+      # Needed to push the version tag and create the GitHub release.
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+      - name: Tag and create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${{ needs.check-version.outputs.version }}"
+          git tag "v$version"
+          git push origin "v$version"
+          gh release create "v$version" dist/* \
+            --title "v$version" \
+            --generate-notes

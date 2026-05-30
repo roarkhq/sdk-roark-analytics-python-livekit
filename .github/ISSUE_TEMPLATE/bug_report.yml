@@ -1,0 +1,70 @@
+name: Bug report
+description: Report a defect in roark-analytics-python-livekit
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug report. For security issues, please use the [private advisory flow](https://github.com/roarkhq/sdk-roark-analytics-python-livekit/security/advisories/new) instead.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of the bug and what you expected to happen.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: Minimal reproduction. Code snippet or link to a small repo is ideal.
+      placeholder: |
+        1. Call `observe_session(ctx, session, ...)` with `...`
+        2. Run the agent against `...`
+        3. Observe `...`
+    validations:
+      required: true
+
+  - type: input
+    id: roark-livekit-version
+    attributes:
+      label: roark-analytics-python-livekit version
+      placeholder: "e.g. 0.1.0 (output of `pip show roark-analytics-python-livekit`)"
+    validations:
+      required: true
+
+  - type: input
+    id: livekit-agents-version
+    attributes:
+      label: livekit-agents version
+      placeholder: "e.g. 1.0.20"
+    validations:
+      required: true
+
+  - type: input
+    id: python-version
+    attributes:
+      label: Python version
+      placeholder: "e.g. 3.11.7"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: runtime
+    attributes:
+      label: Run mode
+      options:
+        - Console mode (local mic/speakers)
+        - Self-hosted livekit-server (dev)
+        - Other (describe below)
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Paste any error output. Please redact tokens, recording URLs, or customer data.
+      render: shell

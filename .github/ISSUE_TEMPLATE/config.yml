@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/roarkhq/sdk-roark-analytics-python-livekit/security/advisories/new
+    about: Please report security issues privately, not as public issues.
+  - name: Roark platform support
+    url: mailto:support@roark.ai
+    about: For questions about the Roark platform itself (not this SDK), email support.
