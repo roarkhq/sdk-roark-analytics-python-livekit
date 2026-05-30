@@ -1,4 +1,4 @@
-"""Tests for the observe_session / track_session helpers.
+"""Tests for the observe_session helper.
 
 These don't require a live livekit-agents runtime — we stub the AgentSession
 and JobContext surfaces the helpers touch (the ``on`` event registration, the
@@ -8,7 +8,6 @@ shutdown-callback hook, and the room/job attributes).
 from __future__ import annotations
 
 import json
-import os
 from typing import Any
 
 import httpx
@@ -17,10 +16,7 @@ import pytest
 from roark_analytics_python_livekit.client import API_KEY_HEADER, RoarkClient
 from roark_analytics_python_livekit.session import (
     _RoarkSession,
-    _inject_mock_tools,
-    get_simulation_data,
     observe_session,
-    track_session,
 )
 
 
@@ -115,12 +111,10 @@ async def test_observe_session_posts_call_started_and_ended() -> None:
         agent_name="Agent One",
         agent_prompt="be nice",
         livekit_call_id="call-xyz",
-        mode="observe",
         capture_audio=False,
         is_test=False,
         metadata={},
     )
-    # Swap in the mocked client.
     state._client = client
 
     await state.start()
@@ -149,6 +143,98 @@ async def test_observe_session_posts_call_started_and_ended() -> None:
 
 
 @pytest.mark.asyncio
+async def test_call_started_tolerates_nonstring_room_attrs() -> None:
+    """Console mode exposes room.name/.sid as mock objects (and some livekit
+    versions make room.sid a coroutine). start() must still produce a
+    JSON-serializable call-started payload, dropping the non-string fields."""
+    from unittest.mock import AsyncMock
+
+    class _MockRoom:
+        name = AsyncMock()
+        sid = AsyncMock()
+
+        def on(self, event: str, cb: Any) -> None:  # noqa: ARG002
+            pass
+
+    class _MockCtx:
+        def __init__(self) -> None:
+            self.job = _StubJob()
+            self.room = _MockRoom()
+
+        def add_shutdown_callback(self, cb: Any) -> None:  # noqa: ARG002
+            pass
+
+    client, posted = _mocked_client()
+    state = _RoarkSession(
+        ctx=_MockCtx(),  # type: ignore[arg-type]
+        session=_StubSession(),  # type: ignore[arg-type]
+        api_key="rk_test",
+        agent_id="agent-1",
+        agent_name=None,
+        agent_prompt=None,
+        livekit_call_id="mock-job-1",
+        capture_audio=False,
+        is_test=False,
+        metadata={},
+    )
+    state._client = client
+
+    await state.start()  # must not raise
+
+    body = posted[-1]["body"]
+    assert body["event"] == "call-started"
+    assert body["jobId"] == "job-123"  # real string survives
+    assert "roomName" not in body  # AsyncMock dropped
+    assert "roomSid" not in body
+
+
+@pytest.mark.asyncio
+async def test_call_started_awaits_async_room_sid() -> None:
+    """Current livekit-rtc exposes ``room.sid`` as an async property (it awaits
+    the server-assigned RM_… id). start() must await it and ship the resolved
+    string as ``roomSid`` — the id the OTel tracing integration links on."""
+
+    class _AsyncSidRoom:
+        name = "room-name"
+
+        @property
+        async def sid(self) -> str:
+            return "RM_async_5678"
+
+        def on(self, event: str, cb: Any) -> None:  # noqa: ARG002
+            pass
+
+    class _AsyncSidCtx:
+        def __init__(self) -> None:
+            self.job = _StubJob()
+            self.room = _AsyncSidRoom()
+
+        def add_shutdown_callback(self, cb: Any) -> None:  # noqa: ARG002
+            pass
+
+    client, posted = _mocked_client()
+    state = _RoarkSession(
+        ctx=_AsyncSidCtx(),  # type: ignore[arg-type]
+        session=_StubSession(),  # type: ignore[arg-type]
+        api_key="rk_test",
+        agent_id="agent-1",
+        agent_name=None,
+        agent_prompt=None,
+        livekit_call_id="job-123",
+        capture_audio=False,
+        is_test=False,
+        metadata={},
+    )
+    state._client = client
+
+    await state.start()
+
+    body = posted[-1]["body"]
+    assert body["roomName"] == "room-name"
+    assert body["roomSid"] == "RM_async_5678"  # awaited, not a coroutine repr
+
+
+@pytest.mark.asyncio
 async def test_aflush_is_idempotent() -> None:
     client, posted = _mocked_client()
     state = _RoarkSession(
@@ -159,7 +245,6 @@ async def test_aflush_is_idempotent() -> None:
         agent_name=None,
         agent_prompt=None,
         livekit_call_id="c1",
-        mode="observe",
         capture_audio=False,
         is_test=False,
         metadata={},
@@ -184,54 +269,60 @@ async def test_observe_session_respects_kill_switch(monkeypatch: pytest.MonkeyPa
     assert out is None
 
 
+def test_install_audio_setter_wraps_current_and_future() -> None:
+    """The setter interceptor must wrap both the value already present and any
+    value assigned later (this is how it catches RoomIO / console assigning
+    ``input.audio`` during ``session.start()``)."""
+
+    class _IO:
+        def __init__(self) -> None:
+            self._a: Any = "preexisting"
+
+        @property
+        def audio(self) -> Any:
+            return self._a
+
+        @audio.setter
+        def audio(self, value: Any) -> None:
+            self._a = value
+
+    io = _IO()
+    _RoarkSession._install_audio_setter(io, lambda v: f"wrapped:{v}")
+
+    assert io.audio == "wrapped:preexisting"  # current value wrapped on install
+    io.audio = "mic"
+    assert io.audio == "wrapped:mic"  # future assignment wrapped too
+    io.audio = None
+    assert io.audio is None  # None passes through unwrapped
+
+
 @pytest.mark.asyncio
-async def test_track_session_respects_kill_switch(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("ROARK_TRACING_ENABLED", "false")
-    out = await track_session(
-        _StubCtx(),  # type: ignore[arg-type]
-        _StubSession(),  # type: ignore[arg-type]
-        api_key="rk",
+async def test_on_audio_frame_feeds_mixer() -> None:
+    client, _ = _mocked_client()
+    state = _RoarkSession(
+        ctx=_StubCtx(),  # type: ignore[arg-type]
+        session=_StubSession(),  # type: ignore[arg-type]
+        api_key="rk_test",
         agent_id="a",
+        agent_name=None,
+        agent_prompt=None,
+        livekit_call_id="c1",
+        capture_audio=True,
+        is_test=False,
+        metadata={},
     )
-    assert out is None
+    state._client = client
+    assert state._audio is not None
 
+    class _Frame:
+        def __init__(self, pcm: bytes, sample_rate: int = 8_000, num_channels: int = 1) -> None:
+            self.data = pcm
+            self.sample_rate = sample_rate
+            self.num_channels = num_channels
 
-def test_get_simulation_data_reads_roark_block() -> None:
-    ctx = _StubCtx(metadata=json.dumps({"roark": {"runId": "r1", "mockTools": {"a": 1}}}))
-    sim = get_simulation_data(ctx)  # type: ignore[arg-type]
-    assert sim == {"runId": "r1", "mockTools": {"a": 1}}
+    import struct
 
-
-def test_get_simulation_data_returns_empty_on_garbage() -> None:
-    ctx = _StubCtx(metadata="not-json")
-    assert get_simulation_data(ctx) == {}  # type: ignore[arg-type]
-
-
-def test_inject_mock_tools_replaces_callable() -> None:
-    class _Tool:
-        name = "lookup_order"
-
-        async def callable(self, order_id: str) -> dict[str, str]:  # noqa: A003
-            raise NotImplementedError
-
-    class _Agent:
-        function_tools = [_Tool()]
-
-    ctx = _StubCtx(metadata=json.dumps({"roark": {"mockTools": {"lookup_order": {"x": 1}}}}))
-    agent = _Agent()
-    _inject_mock_tools(ctx, agent)  # type: ignore[arg-type]
-    # The tool's `callable` should now be the stub returning the scripted value.
-    import asyncio
-
-    out = asyncio.get_event_loop().run_until_complete(_Agent.function_tools[0].callable("ignored"))
-    assert out == {"x": 1}
-
-
-def test_mock_tools_disabled_kill_switch(monkeypatch: pytest.MonkeyPatch) -> None:
-    """ROARK_MOCK_TOOLS_ENABLED=false is honoured by track_session, not _inject directly.
-
-    The kill-switch is checked in ``track_session`` before calling ``_inject_mock_tools``;
-    the lower-level helper does its job regardless. This test just documents the env var.
-    """
-    monkeypatch.setenv("ROARK_MOCK_TOOLS_ENABLED", "false")
-    assert os.environ["ROARK_MOCK_TOOLS_ENABLED"] == "false"
+    pcm = struct.pack("<160h", *([1000] * 160))  # 20ms @ 8kHz mono
+    state._on_audio_frame(_Frame(pcm), channel=0)
+    state._on_audio_frame(_Frame(pcm), channel=1)
+    assert state._audio.first_audio_observed is True

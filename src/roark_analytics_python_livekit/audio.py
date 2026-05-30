@@ -45,6 +45,32 @@ PCM_BYTES_PER_SAMPLE = 2
 NUM_CHANNELS = 2
 BYTES_PER_STEREO_FRAME = PCM_BYTES_PER_SAMPLE * NUM_CHANNELS
 
+# Per-chunk upload retries. A chunk upload is two hops (presign + S3 PUT), and a
+# transient gateway hiccup on either (e.g. a CloudFront 502 from the Roark API)
+# would otherwise drop that chunk permanently — leaving Roark with nothing to
+# merge. Retry the whole presign+PUT a few times with linear backoff. Presigned
+# URLs are one-shot, so each retry re-requests a fresh URL.
+MAX_UPLOAD_ATTEMPTS = 3
+UPLOAD_RETRY_BACKOFF_SECONDS = 0.5
+
+
+def _downmix_to_mono(pcm: bytes, num_channels: int) -> bytes:
+    """Average interleaved 16-bit signed-LE channels down to a single mono lane.
+
+    LiveKit audio frames are usually mono, but a device or track can deliver
+    multiple interleaved channels. The mixer works in mono per side, so collapse
+    anything wider before it reaches ``StereoMixer.add_mono``.
+    """
+    if num_channels <= 1 or not pcm:
+        return pcm
+    samples = struct.unpack(f"<{len(pcm) // PCM_BYTES_PER_SAMPLE}h", pcm)
+    frame_count = len(samples) // num_channels
+    out = [
+        sum(samples[i * num_channels : (i + 1) * num_channels]) // num_channels
+        for i in range(frame_count)
+    ]
+    return struct.pack(f"<{len(out)}h", *out)
+
 
 def _resample_linear(pcm: bytes, src_rate: int, dst_rate: int) -> bytes:
     """Naive linear interpolation resampler for 16-bit signed-LE mono PCM.
@@ -198,6 +224,7 @@ class AudioCapture:
 
         self._mixer = StereoMixer(sample_rate=sample_rate)
         self._chunk_index = 0
+        self._uploaded_count = 0
         self._inflight: set[asyncio.Task[None]] = set()
         self._closed = False
         self._first_audio_observed = False
@@ -206,6 +233,17 @@ class AudioCapture:
     def chunk_index(self) -> int:
         """Number of chunks queued for upload (informational for call-ended)."""
         return self._chunk_index
+
+    @property
+    def uploaded_count(self) -> int:
+        """Number of chunks that actually landed in S3 (after retries).
+
+        Distinct from ``chunk_index`` (chunks *enqueued*): if every upload fails,
+        this stays 0. call-ended uses it to decide whether to advertise a
+        recording — advertising one that never uploaded just makes the server-side
+        merge hunt for chunks that aren't there.
+        """
+        return self._uploaded_count
 
     @property
     def first_audio_observed(self) -> bool:
@@ -244,12 +282,24 @@ class AudioCapture:
         task.add_done_callback(self._inflight.discard)
 
     async def _do_upload(self, idx: int, pcm: bytes) -> None:
-        upload = await self._client.request_chunk_upload_url(
-            livekit_call_id=self._livekit_call_id, chunk_index=idx
+        for attempt in range(1, MAX_UPLOAD_ATTEMPTS + 1):
+            # Presigned URLs are single-use, so re-request a fresh one each attempt.
+            upload = await self._client.request_chunk_upload_url(
+                livekit_call_id=self._livekit_call_id, chunk_index=idx
+            )
+            if upload and await self._client.upload_chunk(
+                upload_url=upload["uploadUrl"], body=pcm
+            ):
+                self._uploaded_count += 1
+                return
+            if attempt < MAX_UPLOAD_ATTEMPTS:
+                await asyncio.sleep(UPLOAD_RETRY_BACKOFF_SECONDS * attempt)
+        log.warning(
+            "chunk %d upload failed after %d attempts; dropping %d bytes",
+            idx,
+            MAX_UPLOAD_ATTEMPTS,
+            len(pcm),
         )
-        if not upload:
-            return
-        await self._client.upload_chunk(upload_url=upload["uploadUrl"], body=pcm)
 
     async def aflush(self) -> None:
         """Drain the tail + await every in-flight upload. Idempotent."""

@@ -1,27 +1,20 @@
-"""``observe_session`` and ``track_session`` — wire an ``AgentSession`` to Roark.
+"""``observe_session`` — wire an ``AgentSession`` to Roark.
 
 ``observe_session(ctx, session, ...)`` (production):
     Registers listeners on the LiveKit ``AgentSession`` for transcripts, tool
     calls, and metrics; subscribes to room audio for stereo recording; POSTs
     ``call-started`` immediately and ``call-ended`` on ``ctx.shutdown_callback``.
 
-``track_session(ctx, session, ...)`` (testing / simulations):
-    Same as ``observe_session`` plus mock-tool injection — replaces each
-    registered function tool on the agent with a coroutine that returns a
-    scripted reply (read from ``ctx.job.metadata.roark.mockTools``).
-
-Failures in either helper are logged and swallowed — Roark must never break
-the agent. Kill-switch env vars:
+Failures are logged and swallowed — Roark must never break the agent.
+Kill-switch env var:
 
 * ``ROARK_OBSERVABILITY_ENABLED=false`` — disable ``observe_session`` outright.
-* ``ROARK_TRACING_ENABLED=false`` — disable ``track_session`` outright.
-* ``ROARK_MOCK_TOOLS_ENABLED=false`` — disable mock-tool injection only.
 """
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
+import inspect
 import json
 import logging
 import os
@@ -38,7 +31,7 @@ from ._types import (
     ToolResultMessage,
     TranscriptMessage,
 )
-from .audio import AudioCapture
+from .audio import AudioCapture, _downmix_to_mono
 from .client import RoarkClient
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -72,10 +65,10 @@ def _to_json_string(value: object) -> str:
 
 
 class _RoarkSession:
-    """Internal state for one tracked/observed agent session.
+    """Internal state for one observed agent session.
 
-    Public callers use ``observe_session`` / ``track_session`` — they construct
-    one of these and register it on the supplied ``AgentSession`` / ``JobContext``.
+    Public callers use ``observe_session`` — it constructs one of these and
+    registers it on the supplied ``AgentSession`` / ``JobContext``.
     """
 
     def __init__(
@@ -88,14 +81,12 @@ class _RoarkSession:
         agent_name: str | None,
         agent_prompt: str | None,
         livekit_call_id: str | None,
-        mode: Literal["observe", "track"],
         capture_audio: bool,
         is_test: bool,
         metadata: dict[str, Any],
     ) -> None:
         self._ctx = ctx
         self._session = session
-        self._mode = mode
         self._metadata = metadata
 
         self._client = RoarkClient(api_key=api_key)
@@ -125,8 +116,6 @@ class _RoarkSession:
         # sample 0, not wall clock. ``None`` until the first frame arrives.
         self._recording_anchor_monotonic: float | None = None
 
-    # ------------------------------------------------------------------ public API
-
     @property
     def livekit_call_id(self) -> str:
         return self._livekit_call_id
@@ -145,24 +134,38 @@ class _RoarkSession:
             payload["agentName"] = self._agent_name
         if self._agent_prompt:
             payload["agentPrompt"] = self._agent_prompt
-        # Best-effort room / job metadata for debugging on the Roark side.
+        # Best-effort room / job metadata for the Roark side. ``roomSid`` is the
+        # server-assigned ``RM_…`` id (present on self-hosted *and* Cloud) that
+        # the OpenTelemetry tracing integration keys on as ``livekit.room.id`` —
+        # capturing it here lets Roark link OTel traces to this call.
+        # Console mode exposes these as mock objects, and on current livekit-rtc
+        # ``room.sid`` is an *async* property (it awaits the server-assigned id),
+        # so resolve awaitables and keep only real, non-empty strings — a
+        # non-serializable or coroutine value must never reach json.dumps.
         with contextlib.suppress(Exception):
-            payload["jobId"] = getattr(self._ctx.job, "id", "") or ""
+            job_id = getattr(self._ctx.job, "id", "")
+            if isinstance(job_id, str) and job_id:
+                payload["jobId"] = job_id
         with contextlib.suppress(Exception):
             room = self._ctx.room
-            payload["roomName"] = getattr(room, "name", "") or ""
-            payload["roomSid"] = getattr(room, "sid", "") or ""
+            room_name = getattr(room, "name", "")
+            if isinstance(room_name, str) and room_name:
+                payload["roomName"] = room_name
+            room_sid: Any = getattr(room, "sid", "")
+            if inspect.isawaitable(room_sid):
+                room_sid = await room_sid
+            if isinstance(room_sid, str) and room_sid:
+                payload["roomSid"] = room_sid
 
         log.info(
-            "call-started: livekitCallId=%s agentId=%s mode=%s",
+            "call-started: livekitCallId=%s agentId=%s",
             self._livekit_call_id,
             self._agent_id,
-            self._mode,
         )
         await self._client.post_call_started(payload)
 
         self._wire_session_listeners()
-        self._wire_room_listeners()
+        self._wire_audio_taps()
         self._wire_shutdown_callback()
 
     async def aflush(self, *, reason: str = "agent-ended") -> None:
@@ -187,7 +190,10 @@ class _RoarkSession:
         }
         if self._first_speaker is not None:
             payload["agentSpokeFirst"] = self._first_speaker == "assistant"
-        if self._audio is not None and self._audio.chunk_index > 0:
+        # Only advertise a recording when chunks actually reached S3. Gating on
+        # chunk_index (chunks *enqueued*) would tell Roark to merge a recording
+        # that never uploaded — e.g. when every chunk-upload-url request 502s.
+        if self._audio is not None and self._audio.uploaded_count > 0:
             payload["recordingSampleRate"] = self._audio.sample_rate
             payload["recordingNumChannels"] = self._audio.num_channels
         if self._transcript:
@@ -199,18 +205,17 @@ class _RoarkSession:
 
         log.info(
             "call-ended: livekitCallId=%s reason=%s transcript=%d toolCalls=%d "
-            "metrics=%d chunks=%d",
+            "metrics=%d chunks=%d/%d uploaded",
             self._livekit_call_id,
             reason,
             len(self._transcript),
             len(self._tool_calls),
             len(self._metrics),
+            self._audio.uploaded_count if self._audio is not None else 0,
             self._audio.chunk_index if self._audio is not None else 0,
         )
         await self._client.post_call_ended(payload)
         await self._client.aclose()
-
-    # ------------------------------------------------------------------ listeners
 
     def _wire_session_listeners(self) -> None:
         """Hook the AgentSession event surface.
@@ -258,80 +263,132 @@ class _RoarkSession:
         with contextlib.suppress(Exception):
             session.on("agent_state_changed", on_agent_state_changed)
 
-    def _wire_room_listeners(self) -> None:
-        """Subscribe to remote + agent audio tracks for the stereo mix."""
+    def _wire_audio_taps(self) -> None:
+        """Tap the AgentSession's own audio I/O for the stereo recording.
+
+        We intercept ``session.input.audio`` (the user mic / inbound track) and
+        ``session.output.audio`` (the agent's post-TTS audio) rather than
+        subscribing to room tracks. This is mode-agnostic: it captures audio
+        identically whether the agent runs against a real LiveKit room
+        (``python agent.py dev``) or the local CLI (``python agent.py console``,
+        which has no room and so never fires ``track_subscribed``).
+
+        ``observe_session`` runs *before* ``session.start()``, and the session
+        only assigns ``input.audio`` / ``output.audio`` during ``start()`` (then
+        immediately hands ``input.audio`` to a forwarding task that captures the
+        reference once). So we can't wrap the streams after the fact — instead we
+        intercept the ``audio`` setters now, so whatever the session assigns gets
+        transparently wrapped at assignment time, before the forwarding task
+        reads it.
+        """
         if self._audio is None:
             return
         try:
-            from livekit import rtc  # type: ignore[import-not-found]
+            from livekit.agents.voice import io as lk_io  # type: ignore[import-not-found]
         except Exception as err:  # pragma: no cover — livekit not installed in tests
-            log.warning("livekit.rtc import failed; audio capture disabled: %r", err)
+            log.warning("livekit audio io import failed; audio capture disabled: %r", err)
             self._audio = None
             return
 
-        room = self._ctx.room
+        session = self._session
+        agent_input = getattr(session, "input", None)
+        agent_output = getattr(session, "output", None)
+        if agent_input is None or agent_output is None:
+            log.warning("session has no input/output; audio capture disabled")
+            self._audio = None
+            return
 
-        def on_track_subscribed(track: Any, _publication: Any, participant: Any) -> None:
-            try:
-                if track.kind != rtc.TrackKind.KIND_AUDIO:
-                    return
-                # Treat any remote participant as the "user" side. In the typical
-                # one-on-one agent flow this is exactly the human caller; for
-                # multi-participant rooms downstream analytics still see the merged
-                # stream.
-                asyncio.create_task(self._consume_audio_track(track, channel=0))
-                log.info(
-                    "subscribed to user audio: participant=%s",
-                    getattr(participant, "identity", "?"),
-                )
-            except Exception as err:
-                log.warning("track_subscribed handler failed: %r", err)
+        observer = self
 
-        with contextlib.suppress(Exception):
-            room.on("track_subscribed", on_track_subscribed)
+        class _UserAudioTap(lk_io.AudioInput):
+            """Pass-through AudioInput that copies each user frame into the mixer."""
 
-        # Agent-side track: the AgentSession publishes its TTS output through the
-        # local participant. We subscribe to the local published track once it's
-        # available — done via the local_track_published event for symmetry.
-        def on_local_track_published(publication: Any, track: Any) -> None:
-            try:
-                if track.kind != rtc.TrackKind.KIND_AUDIO:
-                    return
-                asyncio.create_task(self._consume_audio_track(track, channel=1))
-                log.info("subscribed to agent audio: sid=%s", getattr(publication, "sid", "?"))
-            except Exception as err:
-                log.warning("local_track_published handler failed: %r", err)
+            def __init__(self, source: Any) -> None:
+                super().__init__(label="roark-user-tap", source=source)
 
-        with contextlib.suppress(Exception):
-            room.on("local_track_published", on_local_track_published)
+            async def __anext__(self) -> Any:
+                frame = await super().__anext__()
+                observer._on_audio_frame(frame, channel=0)
+                return frame
 
-    async def _consume_audio_track(self, track: Any, *, channel: int) -> None:
-        """Pull AudioFrames off an AudioStream and feed them into the mixer."""
+        def _wrap_input(stream: Any) -> Any:
+            if stream is None or isinstance(stream, _UserAudioTap):
+                return stream
+            log.info("tapping user audio input (%r)", getattr(stream, "label", "?"))
+            return _UserAudioTap(stream)
+
+        def _wrap_output(sink: Any) -> Any:
+            # The agent output sink is consumed via ``capture_frame`` (a regular
+            # method, so instance-level patching is honoured). Wrapping the method
+            # in place avoids re-implementing the AudioOutput ABC / event wiring.
+            if sink is None or getattr(sink, "_roark_tapped", False):
+                return sink
+            original = sink.capture_frame
+
+            async def _tapped(frame: Any, _orig: Any = original) -> Any:
+                observer._on_audio_frame(frame, channel=1)
+                return await _orig(frame)
+
+            with contextlib.suppress(Exception):
+                sink.capture_frame = _tapped  # type: ignore[method-assign]
+                sink._roark_tapped = True  # type: ignore[attr-defined]
+                log.info("tapping agent audio output (%r)", getattr(sink, "label", "?"))
+            return sink
+
+        self._install_audio_setter(agent_input, _wrap_input)
+        self._install_audio_setter(agent_output, _wrap_output)
+
+    @staticmethod
+    def _install_audio_setter(agent_io: Any, wrap: Any) -> None:
+        """Make ``agent_io.audio = x`` transparently store ``wrap(x)`` instead.
+
+        Wraps the current value (if already set) and reassigns ``agent_io``'s
+        class to a subclass whose ``audio`` setter runs ``wrap`` first, so future
+        assignments by RoomIO / the console are wrapped too. Best-effort: any
+        failure leaves the session untouched.
+        """
+        try:
+            cls = type(agent_io)
+            prop = cls.audio
+
+            with contextlib.suppress(Exception):
+                current = prop.fget(agent_io)
+                if current is not None:
+                    wrapped = wrap(current)
+                    if wrapped is not current:
+                        prop.fset(agent_io, wrapped)
+
+            def _setter(self_io: Any, value: Any, _prop: Any = prop, _wrap: Any = wrap) -> None:
+                _prop.fset(self_io, _wrap(value) if value is not None else None)
+
+            intercepted = type(
+                f"_RoarkTapped{cls.__name__}",
+                (cls,),
+                {"audio": property(prop.fget, _setter)},
+            )
+            agent_io.__class__ = intercepted
+        except Exception as err:
+            log.warning("failed to install audio tap on %r: %r", type(agent_io).__name__, err)
+
+    def _on_audio_frame(self, frame: Any, *, channel: int) -> None:
+        """Feed one tapped frame (user=0 / agent=1) into the stereo mixer."""
         if self._audio is None:
             return
         try:
-            from livekit import rtc  # type: ignore[import-not-found]
-        except Exception:  # pragma: no cover
-            return
-        try:
-            stream = rtc.AudioStream(track)
-        except Exception as err:
-            log.warning("AudioStream init failed (channel=%d): %r", channel, err)
-            return
-        try:
-            async for event in stream:
-                frame = getattr(event, "frame", None)
-                if frame is None:
-                    continue
-                self._anchor_recording_clock()
-                pcm = bytes(getattr(frame, "data", b""))
-                sample_rate = int(getattr(frame, "sample_rate", self._audio.sample_rate))
-                if channel == 0:
-                    self._audio.add_user_frame(pcm, sample_rate=sample_rate)
-                else:
-                    self._audio.add_agent_frame(pcm, sample_rate=sample_rate)
-        except Exception as err:  # pragma: no cover — defensive
-            log.warning("audio consume loop ended (channel=%d): %r", channel, err)
+            self._anchor_recording_clock()
+            pcm = bytes(getattr(frame, "data", b""))
+            if not pcm:
+                return
+            sample_rate = int(getattr(frame, "sample_rate", self._audio.sample_rate))
+            num_channels = int(getattr(frame, "num_channels", 1))
+            if num_channels > 1:
+                pcm = _downmix_to_mono(pcm, num_channels)
+            if channel == 0:
+                self._audio.add_user_frame(pcm, sample_rate=sample_rate)
+            else:
+                self._audio.add_agent_frame(pcm, sample_rate=sample_rate)
+        except Exception as err:  # pragma: no cover — never raise into the session
+            log.warning("audio frame tap failed (channel=%d): %r", channel, err)
 
     def _wire_shutdown_callback(self) -> None:
         """Register call-ended on the JobContext's shutdown hook."""
@@ -347,8 +404,6 @@ class _RoarkSession:
             register(_on_shutdown)
         except Exception as err:
             log.warning("failed to register shutdown callback: %r", err)
-
-    # ------------------------------------------------------------------ handlers
 
     def _handle_conversation_item(self, item: Any) -> None:
         """Translate one ``ChatMessage`` into a Roark transcript entry."""
@@ -469,10 +524,11 @@ class _RoarkSession:
                 continue
             if callable(value):
                 continue
-            if isinstance(value, (int, float, bool, str)) and not isinstance(value, bool):
+            # ``bool`` is an ``int`` subclass, so exclude it here and handle it in
+            # the ``elif`` below — otherwise ``True``/``False`` land in numeric slots.
+            if isinstance(value, (int, float, str)) and not isinstance(value, bool):
                 # Map known field names onto the typed slots; unknown scalars fall
-                # through into ``extra``. ``bool`` is excluded above because it's
-                # an int subclass — handled separately below.
+                # through into ``extra``.
                 if attr in (
                     "end_of_utterance_delay",
                     "endOfUtteranceDelay",
@@ -509,8 +565,6 @@ class _RoarkSession:
             entry["extra"] = extra
         self._metrics.append(entry)
 
-    # ------------------------------------------------------------------ timing
-
     def _anchor_recording_clock(self) -> None:
         if self._recording_anchor_monotonic is None:
             self._recording_anchor_monotonic = time.monotonic()
@@ -527,11 +581,6 @@ def _snake_to_camel(name: str) -> str:
         return name
     head, *rest = name.split("_")
     return head + "".join(p.capitalize() for p in rest)
-
-
-# ============================================================================
-# Public API
-# ============================================================================
 
 
 async def observe_session(
@@ -564,9 +613,8 @@ async def observe_session(
         capture_audio: Set to ``False`` to skip stereo audio capture (saves
             bandwidth; transcripts and tool data still ship).
         capture_logs: Reserved for future log streaming.
-        is_test: Tag the call as a test on the Roark dashboard. ``observe_session``
-            defaults to ``False`` (production traffic); ``track_session`` defaults
-            to ``True``.
+        is_test: Tag the call as a test on the Roark dashboard. Defaults to
+            ``False`` (production traffic).
         **metadata: Free-form metadata for Roark-side correlation (passed
             through to call-started).
 
@@ -602,94 +650,12 @@ async def observe_session(
         agent_name=agent_name,
         agent_prompt=agent_prompt,
         livekit_call_id=livekit_call_id,
-        mode="observe",
         capture_audio=capture_audio,
         is_test=is_test,
         metadata=metadata,
     )
     await state.start()
     return state
-
-
-async def track_session(
-    ctx: JobContext,
-    session: AgentSession,
-    *,
-    api_key: str,
-    agent_id: str,
-    agent: Any | None = None,
-    agent_name: str | None = None,
-    agent_prompt: str | None = None,
-    livekit_call_id: str | None = None,
-    capture_audio: bool = True,
-    capture_logs: bool = True,  # noqa: ARG001
-    is_test: bool = True,
-    **metadata: Any,
-) -> _RoarkSession | None:
-    """Capture a simulation/test session and inject mocked tools.
-
-    Same data capture as ``observe_session``, plus: each function tool on
-    ``agent`` (if supplied) is swapped for a coroutine returning the scripted
-    reply read from ``ctx.job.metadata.roark.mockTools[name]``. Disable mock
-    injection with ``ROARK_MOCK_TOOLS_ENABLED=false`` (still tracks).
-
-    Args mirror ``observe_session``; the extra ``agent`` argument is the LiveKit
-    ``Agent`` instance whose tools should be mocked. Pass ``None`` to skip
-    mocking entirely (data capture still works).
-
-    Returns:
-        The active ``_RoarkSession`` (or ``None`` when
-        ``ROARK_TRACING_ENABLED=false``).
-    """
-    if _env_disabled("ROARK_TRACING_ENABLED"):
-        log.info("track_session: disabled via ROARK_TRACING_ENABLED=false")
-        return None
-    if livekit_call_id is None:
-        livekit_call_id = _resolve_call_id(ctx)
-    state = _RoarkSession(
-        ctx=ctx,
-        session=session,
-        api_key=api_key,
-        agent_id=agent_id,
-        agent_name=agent_name,
-        agent_prompt=agent_prompt,
-        livekit_call_id=livekit_call_id,
-        mode="track",
-        capture_audio=capture_audio,
-        is_test=is_test,
-        metadata=metadata,
-    )
-    await state.start()
-
-    if agent is not None and not _env_disabled("ROARK_MOCK_TOOLS_ENABLED"):
-        _inject_mock_tools(ctx, agent)
-
-    return state
-
-
-def get_simulation_data(ctx: JobContext) -> dict[str, Any]:
-    """Return the ``roark.*`` block of ``ctx.job.metadata`` as a dict.
-
-    The Roark simulation orchestrator attaches scenario / run / test-profile
-    metadata onto each dispatched LiveKit job. This helper parses it so the
-    agent can adapt its behavior per simulation without re-implementing the
-    metadata contract. Returns ``{}`` if metadata is absent or malformed.
-    """
-    try:
-        raw = getattr(ctx.job, "metadata", None) or "{}"
-        parsed = json.loads(raw) if isinstance(raw, str) else raw
-        if isinstance(parsed, dict):
-            roark_meta = parsed.get("roark")
-            if isinstance(roark_meta, dict):
-                return roark_meta
-        return {}
-    except Exception:
-        return {}
-
-
-# ============================================================================
-# Helpers
-# ============================================================================
 
 
 def _resolve_call_id(ctx: JobContext) -> str:
@@ -703,50 +669,4 @@ def _resolve_call_id(ctx: JobContext) -> str:
     return str(uuid.uuid4())
 
 
-def _inject_mock_tools(ctx: JobContext, agent: Any) -> None:
-    """Replace each registered function tool on ``agent`` with a scripted stub.
-
-    Reads the mock table from ``ctx.job.metadata.roark.mockTools`` — a dict of
-    ``{tool_name: result}``. Tools not listed in the table are left untouched so
-    the agent can still call real ones when the simulation only mocks a subset.
-    """
-    sim = get_simulation_data(ctx)
-    mock_table = sim.get("mockTools") if isinstance(sim, dict) else None
-    if not isinstance(mock_table, dict) or not mock_table:
-        log.info("track_session: no roark.mockTools in job metadata; nothing to inject")
-        return
-
-    # The list of function-tool descriptors lives on the Agent instance. The
-    # exact attribute name has varied across livekit-agents versions, so we
-    # probe a small set.
-    candidates = ("function_tools", "_function_tools", "tools", "_tools")
-    tools_list: Any = None
-    for attr in candidates:
-        if hasattr(agent, attr):
-            value = getattr(agent, attr)
-            if value:
-                tools_list = value
-                break
-    if not tools_list:
-        log.info("track_session: no function tools on agent; nothing to mock")
-        return
-
-    for tool in list(tools_list):
-        name = getattr(tool, "name", None) or getattr(tool, "__name__", None)
-        if not name or name not in mock_table:
-            continue
-        scripted = mock_table[name]
-
-        async def _stub(*_args: Any, _scripted: Any = scripted, **_kwargs: Any) -> Any:
-            return _scripted
-
-        with contextlib.suppress(Exception):
-            tool.callable = _stub  # type: ignore[attr-defined]
-        with contextlib.suppress(Exception):
-            tool.fn = _stub  # type: ignore[attr-defined]
-        with contextlib.suppress(Exception):
-            tool.func = _stub  # type: ignore[attr-defined]
-        log.info("track_session: mocked tool %s", name)
-
-
-__all__ = ["observe_session", "track_session", "get_simulation_data"]
+__all__ = ["observe_session"]

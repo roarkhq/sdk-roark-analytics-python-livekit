@@ -17,11 +17,23 @@ API_KEY_HEADER = "x-roark-api-key"
 DEFAULT_TIMEOUT_SECONDS = 30.0
 DEFAULT_CHUNK_TIMEOUT_SECONDS = 10.0
 
-# Roark service endpoints. The integration contract: callers only supply an API key,
-# never a URL. Follows the same /v1/integrations/<provider> shape as Roark's other
-# integrations (vapi, retell, pipecat).
-WEBHOOK_URL = "https://api.roark.ai/v1/integrations/livekit-sdk"
-CHUNK_UPLOAD_URL_ENDPOINT = "https://api.roark.ai/v1/integrations/livekit-sdk/chunk-upload-url"
+# Roark service base URLs + endpoints. The integration contract: callers supply
+# only an API key — the SDK owns its own URLs. The paths follow the same
+# /v1/integrations/<provider> shape as Roark's other integrations (vapi, retell,
+# pipecat).
+#
+# The webhook and chunk-upload lanes are split across two bases while testing:
+# the webhook goes to the deployed orgil dev stage, but chunk-upload-url is served
+# by the local customer-api service (the dev stage's service origin is down).
+# TODO(orgil): collapse both back to https://api.roark.ai before release.
+WEBHOOK_BASE_URL = "https://customer-orgil.dev.api.alpha.roark.ai"
+CHUNK_UPLOAD_BASE_URL = "http://localhost:6401"
+WEBHOOK_PATH = "/v1/integrations/livekit-sdk"
+CHUNK_UPLOAD_PATH = "/v1/integrations/livekit-sdk/chunk-upload-url"
+
+# Fully-qualified endpoints (also referenced directly by tests).
+WEBHOOK_URL = f"{WEBHOOK_BASE_URL}{WEBHOOK_PATH}"
+CHUNK_UPLOAD_URL_ENDPOINT = f"{CHUNK_UPLOAD_BASE_URL}{CHUNK_UPLOAD_PATH}"
 
 log = logging.getLogger("roark_analytics_python_livekit.client")
 
@@ -138,6 +150,11 @@ class RoarkClient:
             resp = await client.post(self._webhook_url, json=body)
         except httpx.HTTPError as err:
             log.warning("webhook %s (call=%s) failed: %r", event, call_id, err)
+            return False
+        except (TypeError, ValueError) as err:
+            # A non-serializable payload value must never raise into the
+            # session — log and drop the event instead.
+            log.warning("webhook %s (call=%s) payload not serializable: %r", event, call_id, err)
             return False
         if resp.status_code >= 400:
             log.warning(

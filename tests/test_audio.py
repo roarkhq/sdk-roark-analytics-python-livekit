@@ -12,6 +12,7 @@ from typing import Any
 
 import pytest
 
+import roark_analytics_python_livekit.audio as audio_mod
 from roark_analytics_python_livekit.audio import (
     BYTES_PER_STEREO_FRAME,
     DEFAULT_CHUNK_BYTES,
@@ -79,5 +80,54 @@ async def test_audio_capture_uploads_chunk_when_buffer_fills() -> None:
     await cap.aflush()
 
     assert cap.chunk_index >= 1
+    assert cap.uploaded_count >= 1
     assert uploaded[0][0] == 0
     assert uploaded[0][1] == DEFAULT_CHUNK_BYTES
+
+
+@pytest.mark.asyncio
+async def test_do_upload_retries_transient_presign_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A transient presign failure (e.g. a 502) is retried, not dropped."""
+    monkeypatch.setattr(audio_mod, "UPLOAD_RETRY_BACKOFF_SECONDS", 0)
+    calls = {"presign": 0, "put": 0}
+
+    class _FlakyClient:
+        async def request_chunk_upload_url(self, *, livekit_call_id: str, chunk_index: int) -> Any:
+            calls["presign"] += 1
+            # First attempt 502s (None); second succeeds.
+            return None if calls["presign"] == 1 else {"uploadUrl": "https://s3/0"}
+
+        async def upload_chunk(self, *, upload_url: str, body: bytes) -> bool:
+            calls["put"] += 1
+            return True
+
+    cap = AudioCapture(client=_FlakyClient(), livekit_call_id="t")  # type: ignore[arg-type]
+    await cap._do_upload(0, b"\x00\x00\x00\x00")
+
+    assert calls["presign"] == 2  # retried once
+    assert calls["put"] == 1  # only the successful attempt PUTs
+    assert cap.uploaded_count == 1
+
+
+@pytest.mark.asyncio
+async def test_do_upload_gives_up_after_max_attempts(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When every attempt fails, the chunk is dropped and uploaded_count stays 0."""
+    monkeypatch.setattr(audio_mod, "UPLOAD_RETRY_BACKOFF_SECONDS", 0)
+    presigns = 0
+
+    class _DeadClient:
+        async def request_chunk_upload_url(self, *, livekit_call_id: str, chunk_index: int) -> Any:
+            nonlocal presigns
+            presigns += 1
+            return None  # always 502
+
+        async def upload_chunk(self, *, upload_url: str, body: bytes) -> bool:  # pragma: no cover
+            raise AssertionError("should never PUT when presign fails")
+
+    cap = AudioCapture(client=_DeadClient(), livekit_call_id="t")  # type: ignore[arg-type]
+    await cap._do_upload(0, b"\x00\x00\x00\x00")
+
+    assert presigns == audio_mod.MAX_UPLOAD_ATTEMPTS
+    assert cap.uploaded_count == 0
