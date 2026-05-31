@@ -4,9 +4,7 @@ All notable changes to `roark-analytics-python-livekit` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
-
-## [0.1.0] - 2026-05-28
+## [0.1.0] - 2026-05-31
 
 Initial public release. Drop-in `observe_session` for LiveKit Agents that ships
 call lifecycle, transcripts, tool calls, metrics, and stereo recordings to
@@ -19,10 +17,16 @@ Roark. Tested against `livekit-agents >= 1.0, < 2`.
   `metrics_collected`, `agent_state_changed`) and taps `session.input.audio`
   (user) + `session.output.audio` (agent) for a stereo recording. Works the
   same in `dev` (room) and `console` mode.
-- Stereo audio capture (`StereoMixer`, `AudioCapture`) — L = user, R = agent,
-  downmixed and resampled to a common rate, chunked and uploaded to Roark via
-  presigned URLs (`/v1/integrations/livekit-sdk/chunk-upload-url`); in-flight
-  uploads are drained before `call-ended` is posted.
+- Stereo call recording — L = user, R = agent. Channel alignment (each turn
+  placed on the timeline, real silence spliced between turns, faster-than-
+  real-time TTS bursts kept at their true duration) reuses livekit-agents' own
+  `RecorderIO`, so the recording matches what LiveKit would write to disk and
+  transcript/tool markers (placed at `audioOffsetMs`) land on the waveform. The
+  sample rate is adopted from the negotiated stream (8 kHz telephony,
+  16/24/48 kHz WebRTC, …) and reported on `call-ended` as `recordingSampleRate`.
+  Audio is chunked and uploaded to Roark via presigned URLs
+  (`/v1/integrations/livekit-sdk/chunk-upload-url`); in-flight uploads are
+  drained before `call-ended` is posted.
 - Lazy agent registration on the first call seen for a given `agent_id`, plus
   per-call lifecycle webhooks (`call-started` / `call-ended`).
 - `aflush(reason=...)` idempotent escape hatch, and an automatic `JobContext`
@@ -40,5 +44,4 @@ Roark. Tested against `livekit-agents >= 1.0, < 2`.
   with a Roark-instrumented support agent, runnable in local `console` mode or
   against a self-hosted `livekit-server`.
 
-[Unreleased]: https://github.com/roarkhq/sdk-roark-analytics-python-livekit/compare/v0.1.0...HEAD
 [0.1.0]: https://github.com/roarkhq/sdk-roark-analytics-python-livekit/releases/tag/v0.1.0
