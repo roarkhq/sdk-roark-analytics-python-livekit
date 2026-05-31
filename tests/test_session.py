@@ -296,9 +296,37 @@ def test_install_audio_setter_wraps_current_and_future() -> None:
     assert io.audio is None  # None passes through unwrapped
 
 
+class _StateEvent:
+    def __init__(self, new_state: str) -> None:
+        self.new_state = new_state
+
+
+class _ItemWithMetrics:
+    """A committed ChatMessage carrying LiveKit's per-utterance speaking metrics."""
+
+    def __init__(
+        self, role: str, content: str, started: float | None, stopped: float | None
+    ) -> None:
+        self.role = role
+        self.content = content
+        self.metrics: dict[str, float] = {}
+        if started is not None:
+            self.metrics["started_speaking_at"] = started
+        if stopped is not None:
+            self.metrics["stopped_speaking_at"] = stopped
+
+
 @pytest.mark.asyncio
-async def test_on_audio_frame_feeds_mixer() -> None:
-    client, _ = _mocked_client()
+async def test_transcript_offsets_use_exact_voice_metrics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Primary path: when the committed item carries ``started_speaking_at`` /
+    ``stopped_speaking_at`` (VAD onset/offset for the user, real playback for the
+    agent), the span is read from those exact voice boundaries — independent of
+    when ``conversation_item_added`` fired and of any TTS burst."""
+    import roark_analytics_python_livekit.session as session_mod
+
+    client, posted = _mocked_client()
     state = _RoarkSession(
         ctx=_StubCtx(),  # type: ignore[arg-type]
         session=_StubSession(),  # type: ignore[arg-type]
@@ -314,15 +342,86 @@ async def test_on_audio_frame_feeds_mixer() -> None:
     state._client = client
     assert state._audio is not None
 
-    class _Frame:
-        def __init__(self, pcm: bytes, sample_rate: int = 8_000, num_channels: int = 1) -> None:
-            self.data = pcm
-            self.sample_rate = sample_rate
-            self.num_channels = num_channels
+    # Recording anchor at t=100. The clock reads t=500 throughout the turns to
+    # prove the span is NOT derived from "now" (the commit instant).
+    clk = {"t": 500.0}
+    monkeypatch.setattr(session_mod.time, "time", lambda: clk["t"])
+    state._recording_started_at = 100.0
+    state._audio.add_stereo_pcm(b"\x00\x00\x00\x00")  # first_audio_observed → True
+    state._wire_session_listeners()
+    session = state._session
 
-    import struct
+    # User voiced [100.2s, 101.0s] → [200ms, 1000ms]. No speaking-state event fired.
+    session.fire("conversation_item_added", _ItemWithMetrics("user", "hi", 100.2, 101.0))  # type: ignore[attr-defined]
+    # Agent voiced [102.0s, 104.5s] → [2000ms, 4500ms] (burst-delivered, irrelevant).
+    session.fire("conversation_item_added", _ItemWithMetrics("assistant", "ok", 102.0, 104.5))  # type: ignore[attr-defined]
 
-    pcm = struct.pack("<160h", *([1000] * 160))  # 20ms @ 8kHz mono
-    state._on_audio_frame(_Frame(pcm), channel=0)
-    state._on_audio_frame(_Frame(pcm), channel=1)
-    assert state._audio.first_audio_observed is True
+    await state.aflush(reason="agent-ended")
+    transcript = posted[-1]["body"]["transcript"]
+
+    user_turn, agent_turn = transcript[0], transcript[1]
+    assert (user_turn["audioOffsetMs"], user_turn["endAudioOffsetMs"]) == (200, 1_000)
+    assert (agent_turn["audioOffsetMs"], agent_turn["endAudioOffsetMs"]) == (2_000, 4_500)
+    # Non-degenerate spans: start strictly before end (the "0-second timestamp" bug).
+    assert user_turn["timestamp"] != user_turn["endTimestamp"]
+
+
+@pytest.mark.asyncio
+async def test_transcript_offsets_track_recording_wall_clock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Fallback path (no per-utterance metrics, e.g. a realtime model without VAD):
+    each turn's start is its ``speaking`` transition and its end is when the item
+    was committed, both relative to recording start — the same clock RecorderIO
+    aligns its audio to. A faster-than-real-time TTS burst can't collapse the span
+    because the span is measured off these signals, not off frame delivery."""
+    import roark_analytics_python_livekit.session as session_mod
+
+    client, posted = _mocked_client()
+    state = _RoarkSession(
+        ctx=_StubCtx(),  # type: ignore[arg-type]
+        session=_StubSession(),  # type: ignore[arg-type]
+        api_key="rk_test",
+        agent_id="a",
+        agent_name=None,
+        agent_prompt=None,
+        livekit_call_id="c1",
+        capture_audio=True,
+        is_test=False,
+        metadata={},
+    )
+    state._client = client
+    assert state._audio is not None
+
+    # Deterministic clock for the session's time.time() reads.
+    clk = {"t": 100.0}
+    monkeypatch.setattr(session_mod.time, "time", lambda: clk["t"])
+
+    # Arm recording at t=100 and mark audio as observed (skip _wire_audio_taps,
+    # which needs a real livekit session); wire only the event listeners.
+    state._recording_started_at = 100.0
+    state._audio.add_stereo_pcm(b"\x00\x00\x00\x00")  # first_audio_observed → True
+    state._wire_session_listeners()
+    session = state._session
+
+    # User turn: speaking onset at t=100.0, committed at t=100.5 → [0ms, 500ms].
+    clk["t"] = 100.0
+    session.fire("user_state_changed", _StateEvent("speaking"))  # type: ignore[attr-defined]
+    clk["t"] = 100.5
+    session.fire("conversation_item_added", _Item("user", "Hi, checking my order"))  # type: ignore[attr-defined]
+
+    # Agent turn: a real 1.0s gap, speaking onset at t=101.0, committed at t=103.0
+    # → [1000ms, 3000ms], even though the TTS frames may have arrived in a burst.
+    clk["t"] = 101.0
+    session.fire("agent_state_changed", _StateEvent("speaking"))  # type: ignore[attr-defined]
+    clk["t"] = 103.0
+    session.fire("conversation_item_added", _Item("assistant", "Sure, let me check"))  # type: ignore[attr-defined]
+
+    await state.aflush(reason="agent-ended")
+    transcript = posted[-1]["body"]["transcript"]
+
+    user_turn, agent_turn = transcript[0], transcript[1]
+    assert user_turn["audioOffsetMs"] == 0
+    assert user_turn["endAudioOffsetMs"] == 500
+    assert agent_turn["audioOffsetMs"] == 1_000
+    assert agent_turn["endAudioOffsetMs"] == 3_000

@@ -13,6 +13,7 @@ Kill-switch env var:
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import inspect
 import json
@@ -31,7 +32,7 @@ from ._types import (
     ToolResultMessage,
     TranscriptMessage,
 )
-from .audio import AudioCapture, _downmix_to_mono
+from .audio import AudioCapture
 from .client import RoarkClient
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -103,6 +104,24 @@ class _RoarkSession:
         self._first_speaker: Literal["assistant", "user"] | None = None
         self._end_flushed = False
 
+        # livekit-agents' RecorderIO (subclassed) does the stereo alignment; this
+        # holds the instance so call-ended can close it (flushing the tail) and so
+        # offsets can read its ``recording_started_at`` anchor. ``None`` until the
+        # audio taps are wired (and stays ``None`` if audio capture is off).
+        self._recorder: Any | None = None
+        # Wall-clock (``time.time``) of when recording was armed; the fallback
+        # anchor before the recorder has seen its first frame.
+        self._recording_started_at: float | None = None
+        # Wall-clock of the latest ``speaking`` transition per side. Fallback anchor
+        # for a turn's start when the committed item carries no per-utterance metrics
+        # (the recorder aligns its output to the same clock).
+        self._user_speaking_at: float | None = None
+        self._agent_speaking_at: float | None = None
+        # Recording sample rate adopted from the negotiated agent output rate (the
+        # rate the recorder resamples both channels to), resolved when the output
+        # audio is wrapped. ``None`` until then → the AudioCapture default is used.
+        self._resolved_sample_rate: int | None = None
+
         # Audio capture is optional — disabling it lets a deployer keep call rows
         # / transcripts without paying the chunked-upload bandwidth.
         self._audio = (
@@ -110,11 +129,6 @@ class _RoarkSession:
             if capture_audio
             else None
         )
-
-        # Anchor for ``audioOffsetMs`` on transcript/tool/metric records — set at
-        # first observed audio frame so offsets align with the recording's WAV
-        # sample 0, not wall clock. ``None`` until the first frame arrives.
-        self._recording_anchor_monotonic: float | None = None
 
     @property
     def livekit_call_id(self) -> str:
@@ -174,8 +188,13 @@ class _RoarkSession:
             return
         self._end_flushed = True
 
-        # Drain audio first — chunks are uploaded async, and call-ended carries the
-        # recording metadata so Roark knows whether to look for chunks.
+        # Close the recorder first so its encode thread flushes every remaining
+        # aligned pair into the upload buffer, then drain that buffer's tail.
+        # call-ended carries the recording metadata so Roark knows whether to look
+        # for chunks.
+        if self._recorder is not None:
+            with contextlib.suppress(Exception):
+                await self._recorder.aclose()
         if self._audio is not None:
             await self._audio.aflush()
 
@@ -246,13 +265,26 @@ class _RoarkSession:
 
         def on_agent_state_changed(ev: Any) -> None:
             try:
-                new_state = getattr(ev, "new_state", None)
-                # First speaker — recorded once the agent first transitions into
-                # speaking before the user has been observed.
-                if new_state == "speaking" and self._first_speaker is None:
-                    self._first_speaker = "assistant"
+                if getattr(ev, "new_state", None) == "speaking":
+                    # Stamp this agent turn's onset on the same wall clock the
+                    # recorder aligns its output to, so the transcript span starts
+                    # where the agent's audio actually begins on the waveform.
+                    self._agent_speaking_at = time.time()
+                    if self._first_speaker is None:
+                        self._first_speaker = "assistant"
             except Exception as err:
                 log.warning("agent_state_changed handler failed: %r", err)
+
+        def on_user_state_changed(ev: Any) -> None:
+            try:
+                if getattr(ev, "new_state", None) == "speaking":
+                    # Same for the user side: the VAD ``speaking`` transition marks
+                    # the turn onset on the recording's wall clock.
+                    self._user_speaking_at = time.time()
+                    if self._first_speaker is None:
+                        self._first_speaker = "user"
+            except Exception as err:
+                log.warning("user_state_changed handler failed: %r", err)
 
         with contextlib.suppress(Exception):
             session.on("conversation_item_added", on_conversation_item_added)
@@ -262,31 +294,42 @@ class _RoarkSession:
             session.on("metrics_collected", on_metrics_collected)
         with contextlib.suppress(Exception):
             session.on("agent_state_changed", on_agent_state_changed)
+        with contextlib.suppress(Exception):
+            session.on("user_state_changed", on_user_state_changed)
 
     def _wire_audio_taps(self) -> None:
-        """Tap the AgentSession's own audio I/O for the stereo recording.
+        """Wire livekit-agents' ``RecorderIO`` onto the session's audio I/O.
 
-        We intercept ``session.input.audio`` (the user mic / inbound track) and
-        ``session.output.audio`` (the agent's post-TTS audio) rather than
-        subscribing to room tracks. This is mode-agnostic: it captures audio
-        identically whether the agent runs against a real LiveKit room
-        (``python agent.py dev``) or the local CLI (``python agent.py console``,
-        which has no room and so never fires ``track_subscribed``).
+        Rather than mixing audio ourselves, we let livekit-agents' own recorder
+        do the channel alignment (it knows the agent's true playback position and
+        splices real inter-turn silence) and only swap its file-encode step for
+        chunked PCM upload — see ``RoarkRecorderIO``.
 
-        ``observe_session`` runs *before* ``session.start()``, and the session
-        only assigns ``input.audio`` / ``output.audio`` during ``start()`` (then
-        immediately hands ``input.audio`` to a forwarding task that captures the
-        reference once). So we can't wrap the streams after the fact — instead we
-        intercept the ``audio`` setters now, so whatever the session assigns gets
-        transparently wrapped at assignment time, before the forwarding task
-        reads it.
+        The recorder wraps ``session.input.audio`` and ``session.output.audio``.
+        Those are only assigned during ``session.start()`` (which runs *after*
+        ``observe_session``), so we install setter interceptors now: whatever the
+        session later assigns is handed to ``record_input`` / ``record_output`` at
+        assignment time. The recorder is started once both sides are wrapped.
+
+        This is mode-agnostic — it captures identically against a real LiveKit
+        room (``agent.py dev``) and the local CLI (``agent.py console``).
+
+        Note: livekit-agents records session audio to a local OGG by default. To
+        avoid that redundant local recording, pass ``record=False`` (or
+        ``record={"audio": False}``) to ``session.start()`` — Roark captures the
+        audio itself here.
         """
         if self._audio is None:
             return
         try:
-            from livekit.agents.voice import io as lk_io  # type: ignore[import-not-found]
+            from livekit.agents.voice.recorder_io import (  # type: ignore[import-not-found]
+                RecorderAudioInput,
+                RecorderAudioOutput,
+            )
+
+            from ._recorder import RoarkRecorderIO
         except Exception as err:  # pragma: no cover — livekit not installed in tests
-            log.warning("livekit audio io import failed; audio capture disabled: %r", err)
+            log.warning("livekit recorder import failed; audio capture disabled: %r", err)
             self._audio = None
             return
 
@@ -298,41 +341,57 @@ class _RoarkSession:
             self._audio = None
             return
 
-        observer = self
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:  # pragma: no cover — observe_session is async, so a loop exists
+            loop = None
+        recorder = RoarkRecorderIO(
+            agent_session=session,
+            sink=self._audio.add_stereo_pcm,
+            sample_rate=self._audio.sample_rate,
+            loop=loop,
+        )
+        self._recorder = recorder
 
-        class _UserAudioTap(lk_io.AudioInput):
-            """Pass-through AudioInput that copies each user frame into the mixer."""
-
-            def __init__(self, source: Any) -> None:
-                super().__init__(label="roark-user-tap", source=source)
-
-            async def __anext__(self) -> Any:
-                frame = await super().__anext__()
-                observer._on_audio_frame(frame, channel=0)
-                return frame
+        def _maybe_start() -> None:
+            # ``input.audio`` and ``output.audio`` are assigned independently during
+            # session.start(); start the recorder only once both sides are wrapped.
+            if recorder._in_record and recorder._out_record and not recorder.recording:
+                # Adopt the negotiated rate as the recorder's resample target (and the
+                # rate reported on call-ended). Must be set before start() — the encode
+                # thread reads it. Falls back to the AudioCapture default when unknown.
+                if self._resolved_sample_rate is not None:
+                    recorder.set_target_sample_rate(self._resolved_sample_rate)
+                    if self._audio is not None:
+                        self._audio.set_sample_rate(self._resolved_sample_rate)
+                self._recording_started_at = time.time()
+                with contextlib.suppress(Exception):
+                    asyncio.get_running_loop().create_task(recorder.start())
 
         def _wrap_input(stream: Any) -> Any:
-            if stream is None or isinstance(stream, _UserAudioTap):
+            if stream is None or isinstance(stream, RecorderAudioInput):
                 return stream
-            log.info("tapping user audio input (%r)", getattr(stream, "label", "?"))
-            return _UserAudioTap(stream)
+            with contextlib.suppress(Exception):
+                wrapped = recorder.record_input(stream)
+                log.info("recording user audio input (%r)", getattr(stream, "label", "?"))
+                _maybe_start()
+                return wrapped
+            return stream
 
         def _wrap_output(sink: Any) -> Any:
-            # The agent output sink is consumed via ``capture_frame`` (a regular
-            # method, so instance-level patching is honoured). Wrapping the method
-            # in place avoids re-implementing the AudioOutput ABC / event wiring.
-            if sink is None or getattr(sink, "_roark_tapped", False):
+            if sink is None or isinstance(sink, RecorderAudioOutput):
                 return sink
-            original = sink.capture_frame
-
-            async def _tapped(frame: Any, _orig: Any = original) -> Any:
-                observer._on_audio_frame(frame, channel=1)
-                return await _orig(frame)
-
             with contextlib.suppress(Exception):
-                sink.capture_frame = _tapped  # type: ignore[method-assign]
-                sink._roark_tapped = True  # type: ignore[attr-defined]
-                log.info("tapping agent audio output (%r)", getattr(sink, "label", "?"))
+                # The output sink advertises the negotiated agent audio rate; adopt it
+                # so the recording isn't force-resampled to a fixed rate (dynamic rate,
+                # provider-agnostic). ``None`` means "any rate" → keep the default.
+                rate = getattr(sink, "sample_rate", None)
+                if isinstance(rate, int) and rate > 0:
+                    self._resolved_sample_rate = rate
+                wrapped = recorder.record_output(sink)
+                log.info("recording agent audio output (%r)", getattr(sink, "label", "?"))
+                _maybe_start()
+                return wrapped
             return sink
 
         self._install_audio_setter(agent_input, _wrap_input)
@@ -370,26 +429,6 @@ class _RoarkSession:
         except Exception as err:
             log.warning("failed to install audio tap on %r: %r", type(agent_io).__name__, err)
 
-    def _on_audio_frame(self, frame: Any, *, channel: int) -> None:
-        """Feed one tapped frame (user=0 / agent=1) into the stereo mixer."""
-        if self._audio is None:
-            return
-        try:
-            self._anchor_recording_clock()
-            pcm = bytes(getattr(frame, "data", b""))
-            if not pcm:
-                return
-            sample_rate = int(getattr(frame, "sample_rate", self._audio.sample_rate))
-            num_channels = int(getattr(frame, "num_channels", 1))
-            if num_channels > 1:
-                pcm = _downmix_to_mono(pcm, num_channels)
-            if channel == 0:
-                self._audio.add_user_frame(pcm, sample_rate=sample_rate)
-            else:
-                self._audio.add_agent_frame(pcm, sample_rate=sample_rate)
-        except Exception as err:  # pragma: no cover — never raise into the session
-            log.warning("audio frame tap failed (channel=%d): %r", channel, err)
-
     def _wire_shutdown_callback(self) -> None:
         """Register call-ended on the JobContext's shutdown hook."""
         try:
@@ -420,20 +459,71 @@ class _RoarkSession:
         if not text:
             return
 
-        now_iso = _utc_now_iso()
+        # Span the entry over the real spoken interval so it lands on the waveform.
+        # The exact voice boundaries come from the committed item's metrics
+        # (VAD/playback derived); see ``_utterance_span``. Falls back to ``None``
+        # offsets when audio capture is off (nothing to align to).
+        start_offset, end_offset = self._utterance_span(role, item)
         entry: TranscriptMessage = {
             "role": role,  # type: ignore[typeddict-item]
             "content": text,
-            "timestamp": now_iso,
-            "endTimestamp": now_iso,
+            "timestamp": self._iso_at_offset(start_offset),
+            "endTimestamp": self._iso_at_offset(end_offset),
         }
-        offset = self._current_audio_offset_ms()
-        if offset is not None:
-            entry["audioOffsetMs"] = offset
-            entry["endAudioOffsetMs"] = offset
+        if start_offset is not None and end_offset is not None:
+            entry["audioOffsetMs"] = start_offset
+            entry["endAudioOffsetMs"] = end_offset
         if self._first_speaker is None and role in {"user", "assistant"}:
             self._first_speaker = "assistant" if role == "assistant" else "user"
         self._transcript.append(entry)
+
+    def _utterance_span(self, role: str, item: Any) -> tuple[int | None, int | None]:
+        """(start, end) offsets in ms on the recording timeline for this turn.
+
+        Prefers the *exact* voice boundaries LiveKit attaches to the committed
+        item — ``item.metrics['started_speaking_at']`` / ``['stopped_speaking_at']``
+        (VAD onset/offset for the user, real playback start/stop for the agent),
+        all on the ``time.time`` clock the recorder anchors to. Falls back to the
+        last ``speaking`` transition for the start and ``now`` for the end when an
+        item carries no metrics (e.g. a realtime model without VAD). Returns
+        ``(None, None)`` when audio capture is off or no audio has been observed.
+        """
+        anchor = self._recording_anchor_time()
+        if self._audio is None or not self._audio.first_audio_observed or anchor is None:
+            return None, None
+        if role not in {"user", "assistant"}:
+            return None, None
+        started_at, stopped_at = self._voice_times_from_metrics(item)
+        if started_at is None:
+            started_at = self._agent_speaking_at if role == "assistant" else self._user_speaking_at
+        now = time.time()
+        end_at = stopped_at if stopped_at is not None else now
+        start_at = started_at if started_at is not None else end_at
+        start = max(0, round((start_at - anchor) * 1000))
+        end = max(0, round((end_at - anchor) * 1000))
+        if start > end:
+            start = end
+        return start, end
+
+    @staticmethod
+    def _voice_times_from_metrics(item: Any) -> tuple[float | None, float | None]:
+        """Exact (started, stopped) speaking wall-clock times for a committed item.
+
+        LiveKit attaches these to ``ChatMessage.metrics`` (a plain dict at runtime):
+        VAD-derived for the user turn, playback-derived for the agent turn. Either
+        may be absent depending on the provider / path, so both are optional.
+        """
+        metrics = getattr(item, "metrics", None)
+        if not isinstance(metrics, dict):
+            return None, None
+
+        def _num(key: str) -> float | None:
+            value = metrics.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                return float(value)
+            return None
+
+        return _num("started_speaking_at"), _num("stopped_speaking_at")
 
     def _handle_function_tools_executed(self, ev: Any) -> None:
         """Translate a function-tools batch into tool_call + tool_result records."""
@@ -565,15 +655,37 @@ class _RoarkSession:
             entry["extra"] = extra
         self._metrics.append(entry)
 
-    def _anchor_recording_clock(self) -> None:
-        if self._recording_anchor_monotonic is None:
-            self._recording_anchor_monotonic = time.monotonic()
+    def _recording_anchor_time(self) -> float | None:
+        """Wall-clock (``time.time``) of the recording's sample 0.
+
+        Prefers the recorder's own ``recording_started_at`` (wall time of its
+        first frame); falls back to when recording was armed. ``None`` before the
+        recorder exists.
+        """
+        if self._recorder is not None:
+            with contextlib.suppress(Exception):
+                started = self._recorder.recording_started_at
+                if started is not None:
+                    return float(started)
+        return self._recording_started_at
 
     def _current_audio_offset_ms(self) -> int | None:
-        anchor = self._recording_anchor_monotonic
-        if anchor is None:
+        """Current position on the recording timeline (for tool/metric markers)."""
+        anchor = self._recording_anchor_time()
+        if self._audio is None or not self._audio.first_audio_observed or anchor is None:
             return None
-        return max(0, round((time.monotonic() - anchor) * 1000))
+        return max(0, round((time.time() - anchor) * 1000))
+
+    def _iso_at_offset(self, offset_ms: int | None) -> str:
+        """Project a recording offset back to an ISO wall-clock timestamp.
+
+        Keeps the ISO ``timestamp`` fields on the same clock as ``audioOffsetMs``.
+        Falls back to ``now`` when there's no recording to anchor against.
+        """
+        anchor = self._recording_anchor_time()
+        if anchor is None or offset_ms is None:
+            return _utc_now_iso()
+        return datetime.fromtimestamp(anchor + offset_ms / 1000, tz=timezone.utc).isoformat()
 
 
 def _snake_to_camel(name: str) -> str:
