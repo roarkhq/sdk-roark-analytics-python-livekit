@@ -720,8 +720,11 @@ async def observe_session(
         agent_name: Display name on the Roark dashboard.
         agent_prompt: System prompt; persisted as the agent's prompt revision
             so changes are tracked over time.
-        livekit_call_id: Optional stable identifier (defaults to ``ctx.job.id``
-            if available, else a random UUID). Sent on every Roark record.
+        livekit_call_id: Optional stable identifier. Defaults to the LiveKit room
+            sid (``ctx.room.sid``) so Roark can link the call to its OpenTelemetry
+            trace; falls back to ``ctx.job.id`` then a random UUID when the sid
+            isn't available (console mode, or if called before ``ctx.connect()``).
+            Sent on every Roark record.
         capture_audio: Set to ``False`` to skip stereo audio capture (saves
             bandwidth; transcripts and tool data still ship).
         capture_logs: Reserved for future log streaming.
@@ -753,7 +756,7 @@ async def observe_session(
         log.info("observe_session: disabled via ROARK_OBSERVABILITY_ENABLED=false")
         return None
     if livekit_call_id is None:
-        livekit_call_id = _resolve_call_id(ctx)
+        livekit_call_id = await _resolve_call_id(ctx)
     state = _RoarkSession(
         ctx=ctx,
         session=session,
@@ -770,14 +773,27 @@ async def observe_session(
     return state
 
 
-def _resolve_call_id(ctx: JobContext) -> str:
-    """Derive a stable call id from the job context, falling back to a UUID."""
-    try:
+async def _resolve_call_id(ctx: JobContext) -> str:
+    """Derive the call id Roark keys on, preferring the LiveKit room sid.
+
+    The server-assigned ``room.sid`` (``RM_…``) is what LiveKit Agents tags its
+    OpenTelemetry spans with (as ``room_id``). Using it as the call id is what lets
+    Roark link the call to its trace — the same identity the LiveKit Cloud
+    integration keys on. ``room.sid`` is an async property only resolvable once the
+    room is connected, so this awaits it (after ``ctx.connect()``) and falls back to
+    the job id (stable but not trace-linkable), then a random UUID — for console mode
+    or when ``observe_session`` runs before connect.
+    """
+    with contextlib.suppress(Exception):
+        room_sid: Any = getattr(ctx.room, "sid", "")
+        if inspect.isawaitable(room_sid):
+            room_sid = await room_sid
+        if isinstance(room_sid, str) and room_sid:
+            return room_sid
+    with contextlib.suppress(Exception):
         job_id = getattr(ctx.job, "id", None)
         if isinstance(job_id, str) and job_id:
             return job_id
-    except Exception:
-        pass
     return str(uuid.uuid4())
 
 

@@ -15,6 +15,7 @@ import pytest
 
 from roark_analytics_python_livekit.client import API_KEY_HEADER, RoarkClient
 from roark_analytics_python_livekit.session import (
+    _resolve_call_id,
     _RoarkSession,
     observe_session,
 )
@@ -255,6 +256,52 @@ async def test_aflush_is_idempotent() -> None:
     posted_count = len(posted)
     await state.aflush(reason="r2")  # second flush is a no-op
     assert len(posted) == posted_count
+
+
+@pytest.mark.asyncio
+async def test_resolve_call_id_prefers_room_sid() -> None:
+    """The room sid (RM_…) is the id Roark links OTel traces on, so it wins over
+    the job id when both are present."""
+    assert await _resolve_call_id(_StubCtx()) == "RM_1234"  # _StubRoom.sid
+
+
+@pytest.mark.asyncio
+async def test_resolve_call_id_awaits_async_room_sid() -> None:
+    """On current livekit-rtc ``room.sid`` is an async property; it must be awaited."""
+
+    class _AsyncSidRoom:
+        @property
+        async def sid(self) -> str:
+            return "RM_async"
+
+    class _Ctx:
+        def __init__(self) -> None:
+            self.room = _AsyncSidRoom()
+            self.job = _StubJob()
+
+    assert await _resolve_call_id(_Ctx()) == "RM_async"  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_resolve_call_id_falls_back_to_job_id_then_uuid() -> None:
+    """No usable sid → job id; neither → a non-empty UUID (never raises)."""
+
+    class _NoSidRoom:
+        sid = ""
+
+    class _NoSidCtx:
+        def __init__(self) -> None:
+            self.room = _NoSidRoom()
+            self.job = _StubJob()  # id="job-123"
+
+    assert await _resolve_call_id(_NoSidCtx()) == "job-123"  # type: ignore[arg-type]
+
+    class _EmptyCtx:
+        room = None
+        job = None
+
+    out = await _resolve_call_id(_EmptyCtx())  # type: ignore[arg-type]
+    assert isinstance(out, str) and out  # random UUID fallback
 
 
 @pytest.mark.asyncio
