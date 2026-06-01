@@ -17,17 +17,8 @@ API_KEY_HEADER = "x-roark-api-key"
 DEFAULT_TIMEOUT_SECONDS = 30.0
 DEFAULT_CHUNK_TIMEOUT_SECONDS = 10.0
 
-# Roark service base URLs + endpoints. The integration contract: callers supply
-# only an API key — the SDK owns its own URLs. The paths follow the same
-# /v1/integrations/<provider> shape as Roark's other integrations (vapi, retell,
-# pipecat).
-#
-# The webhook and chunk-upload lanes are split across two bases while testing:
-# the webhook goes to the deployed orgil dev stage, but chunk-upload-url is served
-# by the local customer-api service (the dev stage's service origin is down).
-# TODO(orgil): collapse both back to https://api.roark.ai before release.
-WEBHOOK_BASE_URL = "https://customer-orgil.dev.api.alpha.roark.ai"
-CHUNK_UPLOAD_BASE_URL = "http://localhost:6401"
+WEBHOOK_BASE_URL = "https://api.roark.ai"
+CHUNK_UPLOAD_BASE_URL = "https://api.roark.ai"
 WEBHOOK_PATH = "/v1/integrations/livekit-sdk"
 CHUNK_UPLOAD_PATH = "/v1/integrations/livekit-sdk/chunk-upload-url"
 
@@ -51,8 +42,7 @@ class RoarkClient:
 
         Args:
             api_key: Roark API key (e.g. ``rk_live_...``). Sent on every Roark
-                request as ``x-roark-api-key`` *and* ``Authorization: Bearer``
-                so both the webhook and the customer-api router accept it.
+                request as both ``x-roark-api-key`` and ``Authorization: Bearer``.
         """
         self._api_key = api_key
         self._webhook_url: str = WEBHOOK_URL
@@ -121,7 +111,7 @@ class RoarkClient:
             parsed = resp.json()
         except ValueError:
             return None
-        # customer-api router wraps responses in {data: ...}; tolerate either shape.
+        # The endpoint may wrap its response in a {data: ...} envelope; tolerate either shape.
         data = parsed.get("data") if isinstance(parsed, dict) and "data" in parsed else parsed
         if not isinstance(data, dict) or "uploadUrl" not in data:
             return None

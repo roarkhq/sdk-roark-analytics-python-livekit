@@ -59,6 +59,8 @@ class SupportAgent(Agent):
 
 
 async def entrypoint(ctx: JobContext) -> None:
+    # Connect first: the room's server-assigned ``sid`` — which observe_session uses
+    # as the call id — is only available once the room is connected.
     await ctx.connect()
 
     session = AgentSession(
@@ -75,9 +77,10 @@ async def entrypoint(ctx: JobContext) -> None:
     )
 
     # --- Roark analytics ---------------------------------------------------
-    # Wire this in BEFORE session.start() so the audio taps are installed
-    # before the session starts streaming frames. Failures are logged and
-    # swallowed — the agent keeps running even if Roark is unreachable.
+    # Wire this in AFTER ctx.connect() (so the room sid is resolvable) but BEFORE
+    # session.start() (so the audio taps are installed before the session streams
+    # frames). Failures are logged and swallowed — the agent keeps running even if
+    # Roark is unreachable.
     await observe_session(
         ctx,
         session,
