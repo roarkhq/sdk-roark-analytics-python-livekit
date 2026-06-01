@@ -60,8 +60,8 @@ class Assistant(Agent):
         super().__init__(instructions=SYSTEM_PROMPT)
 
 async def entrypoint(ctx: JobContext):
-    # Connect before observe_session: the room sid (used as the call id, so Roark
-    # can link the call to its OpenTelemetry trace) is only available once connected.
+    # Connect before observe_session: the room sid (used as the call id) is only
+    # available once connected.
     await ctx.connect()
 
     session = AgentSession(stt=..., llm=..., tts=...)
@@ -185,7 +185,7 @@ is missing, that side will be silent on the merged stereo recording.
 | `agent_id` | `str` | — | **Required.** Customer-stable agent identifier. |
 | `agent_name` | `str \| None` | `None` | Display name. |
 | `agent_prompt` | `str \| None` | `None` | System prompt; persisted as the agent's prompt revision. |
-| `livekit_call_id` | `str \| None` | `ctx.room.sid` → `ctx.job.id` → UUID | Stable call identifier, sent on every Roark record as `livekitCallId`. Defaults to the room sid so Roark can link the call to its OpenTelemetry trace; resolve it by calling `observe_session` after `ctx.connect()`. |
+| `livekit_call_id` | `str \| None` | `ctx.job.room.sid` → `ctx.room.sid` → `ctx.job.id` → UUID | Stable call identifier, sent on every Roark record as `livekitCallId`. Defaults to the room sid (the id Roark keys the call on); resolve the live `ctx.room.sid` by calling `observe_session` after `ctx.connect()`. |
 | `capture_audio` | `bool` | `True` | Set to `False` to skip stereo capture (saves bandwidth). |
 | `capture_logs` | `bool` | `True` | Reserved for future log streaming. |
 | `is_test` | `bool` | `False` | Tag the call as a test on the Roark dashboard. |

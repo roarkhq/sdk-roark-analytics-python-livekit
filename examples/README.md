@@ -5,12 +5,6 @@ A single voice agent (`agent.py`) instrumented with
 the `lookup_order` tool call/result, per-stage metrics, and a stereo recording
 (L = you, R = agent) for every call.
 
-It also exports LiveKit's
-[OpenTelemetry traces](https://docs.roark.ai/documentation/observability/traces#livekit)
-to Roark via `setup_roark_tracer` — the LLM/STT/TTS spans for the call, keyed on
-the room sid so the trace lines up with the call in the dashboard. No extra
-config: it reuses `ROARK_API_KEY`.
-
 Everything here runs **on your own machine** — no LiveKit Cloud involved.
 
 ## 1. Install (uv)

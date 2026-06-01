@@ -150,8 +150,7 @@ class _RoarkSession:
             payload["agentPrompt"] = self._agent_prompt
         # Best-effort room / job metadata for the Roark side. ``roomSid`` is the
         # server-assigned ``RM_…`` id (present on self-hosted *and* Cloud) that
-        # the OpenTelemetry tracing integration keys on as ``livekit.room.id`` —
-        # capturing it here lets Roark link OTel traces to this call.
+        # Roark keys the call on — capturing it here ties this call to its room.
         # Console mode exposes these as mock objects, and on current livekit-rtc
         # ``room.sid`` is an *async* property (it awaits the server-assigned id),
         # so resolve awaitables and keep only real, non-empty strings — a
@@ -721,10 +720,10 @@ async def observe_session(
         agent_prompt: System prompt; persisted as the agent's prompt revision
             so changes are tracked over time.
         livekit_call_id: Optional stable identifier. Defaults to the LiveKit room
-            sid (``ctx.job.room.sid``, falling back to ``ctx.room.sid``) so Roark
-            can link the call to its OpenTelemetry trace; falls back to
-            ``ctx.job.id`` then a random UUID when the sid isn't available (console
-            mode, or if called before ``ctx.connect()``). Sent on every Roark record.
+            sid (``ctx.job.room.sid``, falling back to ``ctx.room.sid``), the id
+            Roark keys the call on; falls back to ``ctx.job.id`` then a random UUID
+            when the sid isn't available (console mode, or if called before
+            ``ctx.connect()``). Sent on every Roark record.
         capture_audio: Set to ``False`` to skip stereo audio capture (saves
             bandwidth; transcripts and tool data still ship).
         capture_logs: Reserved for future log streaming.
@@ -776,15 +775,12 @@ async def observe_session(
 async def _resolve_call_id(ctx: JobContext) -> str:
     """Derive the call id Roark keys on, preferring the LiveKit room sid.
 
-    The server-assigned room sid (``RM_…``) is what LiveKit Agents tags its
-    OpenTelemetry spans with (as ``room_id``). Using it as the call id is what lets
-    Roark link the call to its trace — the same identity the LiveKit Cloud
-    integration keys on. The job's ``ctx.job.room.sid`` carries it as a plain
-    (synchronous) field at dispatch, so we prefer it — it's available before
-    ``ctx.connect()``. We then fall back to the live ``ctx.room.sid`` (an async
-    property only resolvable once connected), then the job id (stable but not
-    trace-linkable), then a random UUID — for console mode or when the sid is
-    otherwise unavailable.
+    The server-assigned room sid (``RM_…``, present on self-hosted *and* Cloud) is
+    the identity Roark keys the call on. The job's ``ctx.job.room.sid`` carries it
+    as a plain (synchronous) field at dispatch, so we prefer it — it's available
+    before ``ctx.connect()``. We then fall back to the live ``ctx.room.sid`` (an
+    async property only resolvable once connected), then the job id, then a random
+    UUID — for console mode or when the sid is otherwise unavailable.
     """
     with contextlib.suppress(Exception):
         job_room_sid = getattr(getattr(ctx.job, "room", None), "sid", "")
