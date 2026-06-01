@@ -4,11 +4,11 @@ All notable changes to `roark-analytics-python-livekit` are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.1.0] - 2026-05-31
+## [Unreleased]
 
-Initial public release. Drop-in `observe_session` for LiveKit Agents that ships
-call lifecycle, transcripts, tool calls, metrics, and stereo recordings to
-Roark. Tested against `livekit-agents >= 1.0, < 2`.
+Drop-in `observe_session` for LiveKit Agents that ships call lifecycle,
+transcripts, tool calls, metrics, and stereo recordings to Roark. Tested against
+`livekit-agents >= 1.0, < 2`.
 
 ### Added
 
@@ -44,4 +44,4 @@ Roark. Tested against `livekit-agents >= 1.0, < 2`.
   with a Roark-instrumented support agent, runnable in local `console` mode or
   against a self-hosted `livekit-server`.
 
-[0.1.0]: https://github.com/roarkhq/sdk-roark-analytics-python-livekit/releases/tag/v0.1.0
+[Unreleased]: https://github.com/roarkhq/sdk-roark-analytics-python-livekit/commits/main
