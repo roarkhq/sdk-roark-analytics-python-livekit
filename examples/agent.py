@@ -30,10 +30,20 @@ from livekit.agents import (
     cli,
     function_tool,
 )
+from livekit.agents.telemetry import set_tracer_provider
 from livekit.plugins import cartesia, openai, silero, speechmatics
 from livekit.plugins.turn_detector.multilingual import MultilingualModel
+from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
 from roark_analytics_python_livekit import observe_session
+
+# Roark ingests LiveKit's OpenTelemetry traces at this OTLP/HTTP endpoint.
+ROARK_TRACES_ENDPOINT = (
+    "https://example.com/v1/traces"
+)
 
 SYSTEM_PROMPT = (
     "You are a friendly support assistant for an online store. "
@@ -58,11 +68,48 @@ class SupportAgent(Agent):
         return {"order_id": order_id, "status": "shipped", "eta": "2 days"}
 
 
+async def setup_roark_tracer(ctx: JobContext) -> None:
+    """Export LiveKit's OpenTelemetry traces (LLM/STT/TTS spans, tool calls) to Roark.
+
+    Roark links a trace to its call by the room sid, which it reads from the
+    ``livekit.room.id`` resource attribute — the same id ``observe_session`` uses
+    as the ``livekitCallId``. The job carries the server-assigned sid as a plain
+    (synchronous) ``ctx.job.room.sid`` field at dispatch, so read it directly.
+    """
+    resource = Resource.create(
+        {
+            "livekit.room.id": ctx.job.room.sid,
+            # Set True to drop traces for test/synthetic calls instead of ingesting them.
+            "roark.skip": False,
+        }
+    )
+    provider = TracerProvider(resource=resource)
+    provider.add_span_processor(
+        BatchSpanProcessor(
+            OTLPSpanExporter(
+                endpoint=ROARK_TRACES_ENDPOINT,
+                headers={"Authorization": f"Bearer {os.environ['ROARK_API_KEY']}"},
+            )
+        )
+    )
+    set_tracer_provider(provider)
+
+    # Spans are batched; flush on shutdown so the tail of the call isn't dropped.
+    async def flush_traces() -> None:
+        provider.force_flush()
+
+    ctx.add_shutdown_callback(flush_traces)
+
+
 async def entrypoint(ctx: JobContext) -> None:
     # Connect first: the room's server-assigned ``sid`` (which observe_session uses
     # as the call id, so Roark can link the call to its OpenTelemetry trace) is only
     # available once the room is connected.
     await ctx.connect()
+
+    # Stream LiveKit's OpenTelemetry traces to Roark. Keyed on the same room sid as
+    # observe_session below, so the trace and the call line up in the dashboard.
+    await setup_roark_tracer(ctx)
 
     session = AgentSession(
         stt=speechmatics.STT(),

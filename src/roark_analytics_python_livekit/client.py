@@ -17,16 +17,14 @@ API_KEY_HEADER = "x-roark-api-key"
 DEFAULT_TIMEOUT_SECONDS = 30.0
 DEFAULT_CHUNK_TIMEOUT_SECONDS = 10.0
 
-# Roark service base URL + endpoints. The integration contract: callers supply
-# only an API key — the SDK owns its own URLs. The paths follow the same
-# /v1/integrations/<provider> shape as Roark's other integrations.
-BASE_URL = "https://api.roark.ai"
+WEBHOOK_BASE_URL = "https://api.roark.ai"
+CHUNK_UPLOAD_BASE_URL = "https://api.roark.ai"
 WEBHOOK_PATH = "/v1/integrations/livekit-sdk"
 CHUNK_UPLOAD_PATH = "/v1/integrations/livekit-sdk/chunk-upload-url"
 
 # Fully-qualified endpoints (also referenced directly by tests).
-WEBHOOK_URL = f"{BASE_URL}{WEBHOOK_PATH}"
-CHUNK_UPLOAD_URL_ENDPOINT = f"{BASE_URL}{CHUNK_UPLOAD_PATH}"
+WEBHOOK_URL = f"{WEBHOOK_BASE_URL}{WEBHOOK_PATH}"
+CHUNK_UPLOAD_URL_ENDPOINT = f"{CHUNK_UPLOAD_BASE_URL}{CHUNK_UPLOAD_PATH}"
 
 log = logging.getLogger("roark_analytics_python_livekit.client")
 

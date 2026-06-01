@@ -7,6 +7,10 @@ dependencies = [
     "livekit-agents[openai,cartesia,silero,turn-detector]",
     "livekit-plugins-speechmatics",
     "roark-analytics-python-livekit",
+    # OpenTelemetry export for LiveKit traces -> Roark (see setup_roark_tracer).
+    "opentelemetry-api",
+    "opentelemetry-sdk",
+    "opentelemetry-exporter-otlp-proto-http",
 ]
 
 [tool.uv]

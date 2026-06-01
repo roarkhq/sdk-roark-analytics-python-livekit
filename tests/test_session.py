@@ -21,10 +21,15 @@ from roark_analytics_python_livekit.session import (
 )
 
 
+class _StubJobRoom:
+    sid = "RM_job"
+
+
 class _StubJob:
     def __init__(self, *, metadata: str | None = None) -> None:
         self.id = "job-123"
         self.metadata = metadata
+        self.room = _StubJobRoom()
 
 
 class _StubRoom:
@@ -259,25 +264,30 @@ async def test_aflush_is_idempotent() -> None:
 
 
 @pytest.mark.asyncio
-async def test_resolve_call_id_prefers_room_sid() -> None:
-    """The room sid (RM_…) is the id Roark links OTel traces on, so it wins over
-    the job id when both are present."""
-    assert await _resolve_call_id(_StubCtx()) == "RM_1234"  # _StubRoom.sid
+async def test_resolve_call_id_prefers_job_room_sid() -> None:
+    """The room sid (RM_…) is the id Roark links OTel traces on. The job carries it
+    synchronously as ``ctx.job.room.sid``, so it wins over the live room sid and the
+    job id when present."""
+    assert await _resolve_call_id(_StubCtx()) == "RM_job"  # _StubJobRoom.sid
 
 
 @pytest.mark.asyncio
-async def test_resolve_call_id_awaits_async_room_sid() -> None:
-    """On current livekit-rtc ``room.sid`` is an async property; it must be awaited."""
+async def test_resolve_call_id_falls_back_to_async_room_sid() -> None:
+    """Without ``ctx.job.room.sid`` we fall back to the live ``ctx.room.sid``, which
+    on current livekit-rtc is an async property and must be awaited."""
 
     class _AsyncSidRoom:
         @property
         async def sid(self) -> str:
             return "RM_async"
 
+    class _NoRoomJob:
+        id = "job-123"
+
     class _Ctx:
         def __init__(self) -> None:
             self.room = _AsyncSidRoom()
-            self.job = _StubJob()
+            self.job = _NoRoomJob()
 
     assert await _resolve_call_id(_Ctx()) == "RM_async"  # type: ignore[arg-type]
 
@@ -289,10 +299,13 @@ async def test_resolve_call_id_falls_back_to_job_id_then_uuid() -> None:
     class _NoSidRoom:
         sid = ""
 
+    class _NoSidJob:
+        id = "job-123"
+
     class _NoSidCtx:
         def __init__(self) -> None:
             self.room = _NoSidRoom()
-            self.job = _StubJob()  # id="job-123"
+            self.job = _NoSidJob()
 
     assert await _resolve_call_id(_NoSidCtx()) == "job-123"  # type: ignore[arg-type]
 
