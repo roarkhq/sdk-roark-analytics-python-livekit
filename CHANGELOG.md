@@ -6,6 +6,8 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-06-04
+
 Drop-in `observe_session` for LiveKit Agents that ships call lifecycle,
 transcripts, tool calls, metrics, and stereo recordings to Roark. Tested against
 `livekit-agents >= 1.0, < 2`.
@@ -44,4 +46,5 @@ transcripts, tool calls, metrics, and stereo recordings to Roark. Tested against
   with a Roark-instrumented support agent, runnable in local `console` mode or
   against a self-hosted `livekit-server`.
 
-[Unreleased]: https://github.com/roarkhq/sdk-roark-analytics-python-livekit/commits/main
+[Unreleased]: https://github.com/roarkhq/sdk-roark-analytics-python-livekit/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/roarkhq/sdk-roark-analytics-python-livekit/releases/tag/v0.1.0
