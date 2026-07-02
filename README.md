@@ -36,7 +36,22 @@ metrics, and a stereo audio recording. No other code changes required.
 pip install roark-analytics-python-livekit
 ```
 
-### 2. Configure
+### 2. Create a LiveKit integration & API key
+
+Every Roark API key is **bound to a specific integration** — the key only
+works for the integration it was created under. Before you can send calls from
+this package, create the integration first:
+
+1. In the [Roark dashboard](https://app.roark.ai), go to **Integrations** and
+   create a new **LiveKit** integration.
+2. Open that integration and generate an **API key** for it.
+3. Copy the key (it looks like `rk_live_...`) — this is the value you'll set as
+   `ROARK_API_KEY` below.
+
+> Use the key created **under the LiveKit integration**. A key from a different
+> integration (or an account-level key not bound to one) will be rejected.
+
+### 3. Configure
 
 Set one env var:
 
@@ -47,7 +62,7 @@ ROARK_API_KEY=rk_live_...
 > The Roark API key is all you configure — the helpers know their own service
 > endpoints.
 
-### 3. Wire `observe_session`
+### 4. Wire `observe_session`
 
 ```python
 from livekit.agents import Agent, AgentSession, JobContext
@@ -118,6 +133,11 @@ uv run --env-file .env agent.py console
 See [`examples/README.md`](./examples/README.md) for local-server mode (a
 self-hosted `livekit-server` + a room client). Everything runs on your own
 machine — no LiveKit Cloud.
+
+> **Both modes use the same `ROARK_API_KEY`** — the key created under your
+> LiveKit integration (see [Create a LiveKit integration & API key](#2-create-a-livekit-integration--api-key)).
+> Only where the key is *stored* differs: a local `.env` / secrets manager for
+> a self-hosted worker, deployment secrets wherever the worker runs.
 
 ---
 
