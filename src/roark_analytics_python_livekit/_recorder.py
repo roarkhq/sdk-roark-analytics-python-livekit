@@ -43,8 +43,8 @@ def _frames_to_mono_i16(frames: list[rtc.AudioFrame]) -> np.ndarray:
         count = f.samples_per_channel * f.num_channels
         arr = np.frombuffer(f.data, dtype=np.int16, count=count)
         if f.num_channels > 1:
-            arr = arr.reshape(-1, f.num_channels)
-            arr = (arr.astype(np.int32).sum(axis=1) // f.num_channels).astype(np.int16)
+            multi = arr.reshape(-1, f.num_channels)
+            arr = (multi.astype(np.int32).sum(axis=1) // f.num_channels).astype(np.int16)
         parts.append(arr)
     return np.concatenate(parts)
 
